@@ -1,0 +1,35 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [claude/eloquent-franklin-005c91]
+    paths: [main.py, Images/**, .github/workflows/build-exe.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyinstaller customtkinter Pillow
+      - run: pyinstaller --noconfirm --onefile --windowed --name IcewindDaleWeatherHelper --icon Images/auril.ico --add-data "Images;Images" --collect-data customtkinter main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IcewindDaleWeatherHelper
+          path: dist/IcewindDaleWeatherHelper.exe
+      - name: Commit exe to branch
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/IcewindDaleWeatherHelper.exe release/
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add release/IcewindDaleWeatherHelper.exe
+          git commit -m "Add built Windows exe [skip ci]"
+          git push
