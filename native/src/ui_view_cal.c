@@ -1,38 +1,40 @@
 /* ui_view_cal.c - the "Calendar of Harptos" block (month head, 30-day grid in three tendays,
- * festival cells, legend, hints, Upcoming) and the selected-day block (eyebrow, date, moon,
- * weather summary, set-current, events & reminders with the inline event form, notes),
- * SPEC.md 8.1-8.3, plus view_cells() from ui.h.
+ * festival cells, Upcoming) and the selected-day block (make-today, events & reminders with
+ * the inline event form, notes), SPEC.md 8.1-8.3, plus view_cells() from ui.h.
+ * The day panel repeats nothing the hero, the timeline or the calendar already show: its
+ * date appears only when the selected day is not the day on screen.
  *
  * Painting model: everything is laid out by one function per block that either measures
  * (draw = false) or paints (draw = true) along the same path, so blk_cal_measure and
  * blk_cal_paint can never disagree. Nothing is cached here except the per-DPI width of the
- * month title column; the weather marks in the cells come from thumb_get() (ui_draw.c),
- * always requested at one size per layout so its single-size cache never thrashes.
+ * month title column and the rendered calendar (cal_cached); the weather marks in the cells
+ * come from thumb_get() (ui_draw.c), always requested at one size per layout so its
+ * single-size cache never thrashes.
  *
  * Hit regions registered here (back-buffer coordinates, already scrolled):
  *   H_CAL_PREV     arg 0      previous month (alm_cal_step(-1))
  *   H_CAL_NEXT     arg 0      next month (alm_cal_step(+1))
- *   H_CAL_TODAY    arg 0      alm_cal_today; tip "Go to the current day" /
- *                             "Go to the expedition start"
+ *   H_CAL_TODAY    arg 0      alm_cal_today; tip "Go to the current day (T)" /
+ *                             "Go to the expedition start (T)"
  *   H_CAL_CELL     arg k      cell index k into view_cells() (0..29 month days, 30.. the
- *                             festivals, the same order as alm_month_cells and Ui.grid_k).
+ *                             festivals, the same order as alm_month_cells).
  *                             Click = alm_select(cells[k].abs, true); double click =
  *                             alm_set_current(cells[k].abs). Tip = alm_fmt_cell_label.
  *   H_UPCOMING     arg abs    an Upcoming row: alm_select(abs, false)
- *   H_SET_CURRENT  arg 0      alm_set_current(g.a.sel_abs); disabled on today
+ *   H_SET_CURRENT  arg 0      "Make this day today": alm_set_current(g.a.sel_abs)
  *   H_EV_EDIT      arg i      index i into alm_marks_on(&g.a, g.a.sel_abs, ...) (only user
  *                             events get the button): ui_open_form(marks[i].event)
  *   H_EV_DEL       arg i      same index: two-step delete. Drawn armed (red, tip "Press
  *                             again to delete") while strcmp(g.armed_id, event->id) == 0;
  *                             main.c arms (copies the id, 3 s timer) / deletes.
- *   H_ADD_EVENT    arg 0      ui_open_form(NULL) (hidden while the form is open)
+ *   H_ADD_EVENT    arg 0      "Add" in the events label row: ui_open_form(NULL) (hidden
+ *                             while the form is open)
  *   H_FORM_TYPE    arg t      AlmEvType 0..3 radio choice -> g.form_type = t
  *   H_FORM_REPEAT  arg 0      the Repeat select: main.c pops ui_popup_choice at the hit rect
  *                             with iwd_repeat_label(0..5), selection g.form_repeat
  *   H_FORM_CANCEL  arg 0      ui_close_form()
  *   H_FORM_SAVE    arg 0      ui_form_submit()
  *   H_NOTES        arg 0      the notes box (ui_notes_begin: create / focus the EDIT)
- *   H_TIP          arg 0      tooltip only (day-panel segment strip)
  *
  * EDIT placement: while painting BLK_DAY this file sets g.rc_title / g.rc_details (only when
  * g.form_open, else empty) and g.rc_notes, in content coordinates (x as in the back buffer,
@@ -169,20 +171,6 @@ static void chip_draw(const AlmMark *m, int f, int x, int y, int w, int h)
     tx_ellipsis(f, tx0, y + (h - fh(f)) / 2, x + w - dp(6) - tx0, wz(m->chip), C_TEXT);
 }
 
-/* legend chip: rule + label */
-static int legend_chip(int x, int y, AlmEvType t, bool draw)
-{
-    const WCHAR *s = wz(alm_ev_type_label(t));
-    int h = fh(F_SMALL) + dp(6), w = dp(3) + dp(6) + tw(F_SMALL, s, -1) + dp(8);
-    if (draw) {
-        DWORD col = type_rgb(t);
-        px_box(x, y, x + w, y + h, mix(C_PANEL, col, 22), mix(C_PANEL, col, 80));
-        px_fill(x, y, x + px1(3), y + h, col);
-        tx(F_SMALL, x + dp(9), y + dp(3), s, -1, C_TEXT);
-    }
-    return w;
-}
-
 /* ================================================================== calendar geometry */
 
 static int s_title_w, s_title_dpi;
@@ -257,7 +245,6 @@ static bool s_fest_cell;              /* cell_paint called by fest_paint: it dra
 static void cell_paint(const AlmCell *c, int k, int x0, int y0, int x1, int y1, const CalGeom *G)
 {
     bool hot = is_hot(H_CAL_CELL, k);
-    bool focus = g.grid_focus && g.grid_k == k;
     DWORD fill = C_PANEL2, border = hot ? C_FRAME : C_LINE;
     int p = dp(4), yy = y0 + dp(5), x, i, th = px1(2);
     WCHAR tip[200]; char lab[512];
@@ -351,15 +338,10 @@ static void cell_paint(const AlmCell *c, int k, int x0, int y0, int x1, int y1, 
     }
 
     /* edges and states */
-    if (c->has_top_event) px_fill(x0 + dp(3), y1 - 1 - th, x1 - dp(3), y1 - 1, type_rgb(c->top_type));
     if (c->is_start) px_fill(x0 + 1, y0 + 1, x0 + 1 + th, y1 - 1, C_AURORA);
     if (c->is_today) px_frame(x0, y0, x1, y1, th, C_BRIGHT);
     if (c->is_pre) px_blend(x0, y0, x1, y1, C_PANEL, 150);
     if (c->tag && !s_fest_cell) tag_pill((x0 + x1) / 2, y0 + dp(3), c->is_today);
-    if (focus) {
-        int o = dp(3);
-        px_frame(x0 - o, y0 - o, x1 + o, y1 + o, 1, C_ACCENT);
-    }
 
     alm_fmt_cell_label(&g.a, c, lab, sizeof lab);
     w8(lab, tip, 200);
@@ -392,7 +374,7 @@ static int cal_head(int x, int y, int w, bool draw)
     if (draw && vis(y, y + h)) {
         const IwdMonth *mo = iwd_month(g.a.ui.cal_month);
         int tw0 = month_title_w(), xl = x + pad, cy = y + h / 2, by = cy - bs / 2;
-        int today_w = btn_w(L"Today") + tw(F_TINY_B, L"T", -1) + dp(14), xr = x + w - pad, tbx0 = xr - today_w;
+        int today_w = btn_w(L"Today"), xr = x + w - pad, tbx0 = xr - today_w;
         int title_x, title_w, ty;
         int32_t t;
         bool has_today = alm_today_abs(&g.a, &t);
@@ -415,11 +397,6 @@ static int cal_head(int x, int y, int w, bool draw)
         /* right: Today button, year box */
         btn(tbx0, by, xr, by + bs, H_CAL_TODAY, 0, true, L"Today",
             has_today ? L"Go to the current day (T)" : L"Go to the expedition start (T)", BTS_GHOST, BG_NONE);
-        {   /* key cap inside the button, right of the label */
-            int kw = tw(F_TINY_B, L"T", -1) + dp(8), kx = xr - dp(6) - kw, ky = (by + by + bs - fh(F_TINY_B)) / 2 - dp(1);
-            px_frame(kx, ky, kx + kw, ky + fh(F_TINY_B) + dp(2), 1, C_FRAME);
-            tx(F_TINY_B, kx + dp(4), ky + dp(1), L"T", -1, C_MUTED);
-        }
         snprintf(yb, sizeof yb, "%ld DR", (long)g.a.ui.cal_year);
         w8(yb, wy, 32);
         {
@@ -444,37 +421,17 @@ static int cal_head(int x, int y, int w, bool draw)
     return h;
 }
 
-static int cal_legend(int x, int y, int w, bool draw)
-{
-    int pad = dp(14), x0 = x + pad, x1 = x + w - pad, cx = x0, yy = y, rowh = fh(F_SMALL) + dp(6), gap = dp(8), t;
-    const WCHAR *nm = L"New moon \x00B7 sacrifice to Auril";
-    const WCHAR *hint = L"Click a day to view it \x00B7 double-click to make it today \x00B7 right-click for more";
-    int nmw = dp(14) + tw(F_SMALL, nm, -1);
-    for (t = 0; t < ALM_EV_TYPE_COUNT; t++) {
-        int cw = legend_chip(0, 0, (AlmEvType)t, false);
-        if (cx > x0 && cx + cw > x1) { cx = x0; yy += rowh + dp(5); }
-        legend_chip(cx, yy, (AlmEvType)t, draw && vis(yy, yy + rowh));
-        cx += cw + gap;
-    }
-    if (cx > x0 && cx + nmw > x1) { cx = x0; yy += rowh + dp(5); }
-    if (draw && vis(yy, yy + rowh)) {
-        aa_flake(cx + dp(5), yy + rowh / 2.0, dp(5), type_rgb(ALM_EV_AURIL), 235);
-        aa_flush();
-        tx(F_SMALL, cx + dp(14), yy + dp(3), nm, -1, C_SOFT);
-    }
-    yy += rowh + dp(6);
-    yy += wrap(F_SMALL_I, x0, yy, x1 - x0, hint, C_DIM, draw && vis(yy, yy + 3 * fh(F_SMALL_I)));
-    return yy - y;
-}
-
 static int cal_upcoming(int x, int y, int w, bool draw)
 {
     AlmUpcoming up[ALM_UPCOMING_DAYS + 1];
-    int n = alm_upcoming(&g.a, up), i;
+    int n = alm_upcoming(&g.a, up), i, k0;
     int pad = dp(14), x0 = x + pad, x1 = x + w - pad, yy = y;
     int32_t today;
     bool has_today = alm_today_abs(&g.a, &today);
     int headh = dp(26);
+    /* today's marks are on the hero and in the day panel: Upcoming starts tomorrow */
+    for (i = k0 = 0; i < n; i++) if (up[i].rel_days != 0) up[k0++] = up[i];
+    n = k0;
     if (draw && vis(yy, yy + headh)) {
         const WCHAR *t = L"Upcoming", *note = has_today ? L"next ten days from today" : L"from the expedition start";
         int tw0 = tw_caps(F_CAPS, t);
@@ -517,7 +474,7 @@ static int cal_upcoming(int x, int y, int w, bool draw)
             w8(rel, wr, 32); w8(dt, wd, IWD_DATE_CAP);
             {
                 int ly = yy + (rowh - lefth) / 2;
-                tx_ellipsis(F_SMALL_B, x0 + rp, ly, lw - dp(6), wr, up[i].rel_days == 0 ? C_BRIGHT : C_TEXT);
+                tx_ellipsis(F_SMALL_B, x0 + rp, ly, lw - dp(6), wr, C_TEXT);
                 tx_ellipsis(F_SMALL, x0 + rp, ly + fh(F_SMALL_B), lw - dp(6), wd, C_MUTED);
             }
             cx = bx0; cy = 0;
@@ -579,9 +536,7 @@ static int cal_layout(int x, int y, int w, bool draw)
         }
         yy += fch;
     }
-    yy += dp(14);
-    yy += cal_legend(x, yy, w, draw);
-    yy += dp(12);
+    yy += dp(16);
     yy += cal_upcoming(x, yy, w, draw);
     return yy - y + dp(10);
 }
@@ -731,7 +686,7 @@ static int day_events(int x0, int y, int x1, bool draw)
     int n = alm_marks_on(&g.a, g.a.sel_abs, marks, 64), i, yy = y;
     if (n > 64) n = 64;
     if (n <= 0) {
-        yy += wrap(F_SMALL_I, x0, yy, x1 - x0, L"No events or reminders on this day.", C_MUTED, draw && vis(yy, yy + 2 * fh(F_SMALL_I)));
+        yy += wrap(F_SMALL_I, x0, yy, x1 - x0, L"None on this day.", C_MUTED, draw && vis(yy, yy + 2 * fh(F_SMALL_I)));
         return yy - y + dp(8);
     }
     for (i = 0; i < n; i++) {
@@ -790,124 +745,59 @@ static int day_events(int x0, int y, int x1, bool draw)
 static int day_layout(int x, int y, int w, bool draw)
 {
     static AlmDayPanel p;                 /* large-ish; UI thread only */
+    AlmHero hr;
+    int32_t today;
+    bool has_today, is_today;
     int pad = dp(14), x0 = x + pad, x1 = x + w - pad, yy = y + dp(12), iw;
     if (x1 < x0 + dp(120)) x1 = x0 + dp(120);
     iw = x1 - x0;
     alm_day_panel(&g.a, &p);
+    alm_hero(&g.a, &hr);
+    has_today = alm_today_abs(&g.a, &today);
+    is_today = has_today && today == g.a.sel_abs;
 
-    /* eyebrow, date, sub */
-    if (draw && vis(yy, yy + fh(F_CAPS))) {
-        int32_t t;
-        bool today = alm_today_abs(&g.a, &t) && t == g.a.sel_abs;
-        tx_caps(F_CAPS, x0, yy, wz(p.eyebrow), today ? C_ACCENT : C_MUTED);
-    }
-    yy += fh(F_CAPS) + dp(4);
-    yy += wrap(F_DATE, x0, yy, iw, wz(p.date), C_BRIGHT, draw && vis(yy, yy + 2 * fh(F_DATE)));
-    yy += dp(2);
-    yy += wrap(F_SMALL, x0, yy, iw, wz(p.sub), C_MUTED, draw && vis(yy, yy + 3 * fh(F_SMALL)));
-    yy += dp(10);
-
-    /* moon */
-    {
-        IwdMoon mo = iwd_moon(g.a.sel_abs, g.a.moon_offset);
-        int r = dp(12), tx0 = x0 + 2 * r + dp(10), lh = fh(F_BODY_B) + fh(F_SMALL);
-        int h = lh > 2 * r ? lh : 2 * r;
-        if (draw && vis(yy, yy + h)) {
-            aa_moon(x0 + r, yy + h / 2.0, r, &mo);
-            aa_flush();
-            tx_ellipsis(F_BODY_B, tx0, yy + (h - lh) / 2, x1 - tx0, wz(p.moon_name), C_TEXT);
-            tx_ellipsis(F_SMALL, tx0, yy + (h - lh) / 2 + fh(F_BODY_B), x1 - tx0, wz(p.moon_sub),
-                        p.moon_is_new ? type_rgb(ALM_EV_AURIL) : C_MUTED);
+    /* the selected day is not the one on screen (before the start, beyond the almanac):
+       name it, and say why it has no weather */
+    if (g.a.sel_abs != hr.abs) {
+        yy += wrap(F_BODY_B, x0, yy, iw, wz(p.date), C_BRIGHT, draw && vis(yy, yy + 2 * fh(F_BODY_B)));
+        if (!p.weather) {
+            yy += dp(2);
+            yy += wrap(F_SMALL_I, x0, yy, iw, wz(p.weather_none), C_MUTED, draw && vis(yy, yy + 3 * fh(F_SMALL_I)));
         }
-        yy += h + dp(12);
-    }
-
-    /* weather summary */
-    if (!p.weather) {
-        yy += wrap(F_SMALL_I, x0, yy, iw, wz(p.weather_none), C_MUTED, draw && vis(yy, yy + 3 * fh(F_SMALL_I)));
         yy += dp(12);
-    } else {
-        const IwdDay *d = p.weather;
-        const IwdEventDef *ev = iwd_event(p.dominant_id);
-        int ip = dp(10), bx0 = x0 + ip + dp(3), bx1 = x1 - ip, by = yy + ip, h, nh, sh, sth = px1(12);
-        int stat_lab = tw(F_SMALL_B, L"Temperature", -1) + dp(10), lines;
-        WCHAR *seq = wz_dup(p.wx_seq);
-        nh = fh(F_BODY_B);
-        sh = seq ? wrap(F_SMALL, bx0, 0, bx1 - bx0, seq, C_MUTED, false) : 0;
-        lines = 2 * fh(F_SMALL) + dp(2);
-        h = ip + nh + sh + dp(8) + sth + dp(8) + lines + ip;
-        if (draw && vis(yy, yy + h)) {
-            DWORD col = iwd_event_rgb(p.dominant_id) & 0xFFFFFF;
-            int i, sx0 = bx0, sw = bx1 - bx0, ty;
-            px_box(x0, yy, x1, yy + h, mix(C_PANEL, 0x041020, 110), mix(C_PANEL, 0xC8EBFF, 22));
-            px_fill(x0, yy, x0 + px1(3), yy + h, col);
-            tx_ellipsis(F_BODY_B, bx0, by, sw, ev ? wz(ev->name) : L"", C_BRIGHT);
-            if (seq) wrap(F_SMALL, bx0, by + nh, sw, seq, C_MUTED, true);
-            ty = by + nh + sh + dp(8);
-            /* segment strip: slices of each event's scene (as the timeline), 1 px separators */
-            px_fill(sx0, ty, sx0 + sw, ty + sth, C_FIELD);
-            for (i = 0; i < d->n_segments; i++) {
-                const IwdSegment *s = &d->segments[i];
-                const IwdEventDef *se = iwd_event(s->id);
-                const Image *im = img_med(s->id);
-                int a = sx0 + s->start * sw / 24, b = sx0 + s->end * sw / 24;
-                char tb[160]; WCHAR wt[160];
-                if (b <= a) continue;
-                if (im && im->px && a >= 0 && b <= g_tgt->w && ty >= 0 && ty + sth <= g_tgt->h) {
-                    double sx0i = s->start / 24.0 * im->w, sx1i = s->end / 24.0 * im->w;
-                    double band = (double)im->w / sw * sth, cyi = im->h * 0.45, sy0;
-                    if (band > im->h) band = im->h;
-                    sy0 = cyi - band / 2;
-                    if (sy0 < 0) sy0 = 0;
-                    if (sy0 + band > im->h) sy0 = im->h - band;
-                    GdiFlush();
-                    resample_box(im, sx0i, sy0, sx1i, sy0 + band, g_tgt->px + (size_t)ty * g_tgt->w + a, b - a, sth, g_tgt->w);
-                    px_fill(a, ty, b, ty + px1(2), iwd_event_rgb(s->id) & 0xFFFFFF);
-                } else {
-                    px_fill(a, ty, b, ty + sth, iwd_event_rgb(s->id) & 0xFFFFFF);
-                }
-                if (i > 0) px_fill(a, ty, a + 1, ty + sth, C_BG);
-                snprintf(tb, sizeof tb, "%s \xC2\xB7 %02d:00\xE2\x80\x93%02d:00", se ? se->name : "?", s->start, s->end);
-                w8(tb, wt, 160);
-                hot_add(a, ty - dp(3), b, ty + sth + dp(3), H_TIP, 0, true, wt);
-            }
-            ty += sth + dp(8);
-            tx(F_SMALL_B, bx0, ty, L"Temperature", -1, C_SOFT);
-            tx_ellipsis(F_SMALL, bx0 + stat_lab, ty, sw - stat_lab, wz(p.wx_temp), C_TEXT);
-            ty += fh(F_SMALL) + dp(2);
-            tx(F_SMALL_B, bx0, ty, L"Cold table", -1, C_SOFT);
-            tx_ellipsis(F_SMALL, bx0 + stat_lab, ty, sw - stat_lab, wz(p.wx_cold), C_TEXT);
-        }
-        free(seq);
-        yy += h + dp(12);
     }
 
-    /* set as current day */
-    if (p.show_set_current && !p.set_current_disabled) {   /* on today the eyebrow says it */
-        const WCHAR *lab = wz(p.set_current_label ? p.set_current_label : "Set as current day");
+    /* the one visible way to move today */
+    if (p.show_set_current && !is_today && !(g.a.current < 0 && g.a.sel_abs == g.a.start_abs)) {
+        const WCHAR *lab = L"Make this day today";
         int bw = btn_w(lab), bh = btn_h() + dp(4);
         if (bw > iw) bw = iw;
         if (draw && vis(yy, yy + bh))
-            btn(x0, yy, x0 + bw, yy + bh, H_SET_CURRENT, 0, !p.set_current_disabled, lab,
-                p.set_current_disabled ? NULL : L"Make this the party's current day (double-click a day, or Shift+Enter)",
+            btn(x0, yy, x0 + bw, yy + bh, H_SET_CURRENT, 0, true, lab,
+                L"Make this the party's current day (or double-click the day in the calendar)",
                 BTS_GHOST, BG_NONE);
         yy += bh + dp(14);
     }
 
-    /* events & reminders */
-    yy += section_label(x0, yy, L"Events & reminders", NULL, draw);
+    /* events & reminders, "Add" at the right of the label row */
+    {
+        const WCHAR *al = L"Add";
+        int bw = btn_w(al), bh = fh(F_BTN) + dp(8), lh = fh(F_CAPS) + dp(8), rh = bh + dp(6) > lh ? bh + dp(6) : lh;
+        section_label(x0, yy + (rh - lh) / 2, L"Events & reminders", NULL, draw);
+        if (!g.form_open && draw && vis(yy, yy + rh))
+            btn(x1 - bw, yy + (rh - bh) / 2, x1, yy + (rh - bh) / 2 + bh, H_ADD_EVENT, 0, true, al, L"New event or reminder on this day (E)",
+                BTS_GHOST, BG_NONE);
+        yy += rh;
+    }
     yy += day_events(x0, yy, x1, draw);
     if (g.form_open) {
         yy += day_form(x0, yy, x1, draw) + dp(12);
     } else {
-        int bw = btn_w(L"Add event / reminder"), bh = btn_h() + dp(2);
-        if (bw > iw) bw = iw;
         if (draw) {
             SetRectEmpty(&g.rc_title);
             SetRectEmpty(&g.rc_details);
-            if (vis(yy, yy + bh)) btn(x0, yy, x0 + bw, yy + bh, H_ADD_EVENT, 0, true, L"Add event / reminder", NULL, BTS_GHOST, BG_NONE);
         }
-        yy += bh + dp(14);
+        yy += dp(8);
     }
 
     /* notes */
@@ -954,14 +844,14 @@ int blk_cal_measure(int which, int w)
 
 /* The calendar is the costliest block (30 cells, moon discs, thumbnails) and changes
  * rarely, so it is rendered into its own surface and re-blitted while its inputs stay the
- * same; play ticks, hour steps and hovering elsewhere then cost one copy. The hit regions
+ * same; time steps, scrubbing and hovering elsewhere then cost one copy. The hit regions
  * of the render are kept with it (block-relative) and re-registered on every paint. */
 typedef struct CalKey {
     int w, h, dpi;
     uint32_t epoch, rev;
     int32_t n_days, current, view, sel_abs, start_abs, cal_year;
-    int cal_month, n_events, grid_k, hot_id, hot_arg, press_id, press_arg;
-    bool celsius, grid_focus, has_today;
+    int cal_month, n_events, hot_id, hot_arg, press_id, press_arg;
+    bool celsius, has_today;
     double moon_offset;
 } CalKey;
 static Surface s_cal;
@@ -985,7 +875,6 @@ static void cal_cached(int x, int y, int w, int h)
     k.n_days = g.a.n_days; k.current = g.a.current; k.view = g.a.view; k.sel_abs = g.a.sel_abs;
     k.start_abs = g.a.start_abs; k.cal_year = g.a.ui.cal_year; k.cal_month = g.a.ui.cal_month;
     k.n_events = g.a.n_events; k.celsius = g.a.celsius; k.moon_offset = g.a.moon_offset;
-    k.grid_focus = g.grid_focus; k.grid_k = g.grid_focus ? g.grid_k : 0;
     k.has_today = alm_today_abs(&g.a, &t);
     if (cal_hot_id(g.hot_id)) { k.hot_id = g.hot_id; k.hot_arg = g.hot_arg; }
     if (cal_hot_id(g.press_id)) { k.press_id = g.press_id; k.press_arg = g.press_arg; }

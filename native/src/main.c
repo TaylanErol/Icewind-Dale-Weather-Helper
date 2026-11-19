@@ -4,41 +4,37 @@
  * all behaviour lives in engine.c / store.c (SPEC.md).
  *
  * Idle cost: nothing runs while idle. Timers exist only while something is in motion:
- *   T_PLAY     playback (250 ms ticks; time advances by real elapsed / 1.25 s per hour)
  *   T_TOAST    one-shot, hides the toast after 4.2 s (day toasts 7 s)
  *   T_NOTE     one-shot notes autosave debounce (600 ms)
  *   T_ARM      one-shot, disarms a two-step delete after 3 s
  *   T_SAVE     one-shot debounced save (ALM_SAVE_SOON_MS = 250 ms, killed when it fires):
- *              routine steps (hour / day steps, advance, scrubbing, playback stopping,
- *              calendar paging, select) save non-durably through it. Explicit or
- *              destructive actions (close / end session, boot, import, settings,
- *              event add / edit / delete, notes, unit and sound toggles, make-today,
- *              undo) save durably at once via ui_save_now(), which also cancels a pending
- *              debounced save (the durable write covers it).
+ *              routine steps (time / day steps including a midnight advance, Advance Day,
+ *              scrubbing, calendar paging, select, the dice-ledger chip) save non-durably
+ *              through it. Explicit or destructive actions (close / end session, boot,
+ *              import, settings, event add / edit / delete, notes, unit and sound toggles,
+ *              make-today, undo) save durably at once via ui_save_now(), which also cancels
+ *              a pending debounced save (the durable write covers it).
  *   T_THUNDER  one-shot, re-armed only while sound is on and the viewed hour is a
  *              Lightning Storm (random 0.8-4.3 s)
  *   T_FADE     30 ms ticks, 8 at most: hero cross-fade when a discrete step (key or click,
- *              never playback or scrubbing) changes the weather event
+ *              never scrubbing) changes the weather event
  * WM_PAINT re-composes the back buffer (view_paint) only when something changed
  * (ui_redraw / ui_relayout / resize); plain exposes just blit it.
  *
  * HIT-REGION DISPATCH (id: arg expected here; every id is handled defensively)
  *   H_NONE, H_TIP          ignored (cover / tooltip only)
- *   H_SEED            0    Settings with the seed field focused (web: openSettings('seed'))
  *   H_UNIT_F / H_UNIT_C 0  alm_set_unit
  *   H_SOUND           0    ui_sound_toggle
- *   H_SETTINGS, H_FOOT_SETTINGS 0   Settings
+ *   H_SETTINGS, H_INTRO_SETTINGS 0  Settings
  *   H_ADVANCE         0    alm_advance(12)
- *   H_PREV_HOUR / H_NEXT_HOUR 0     alm_step_hour(-1 / +1)
- *   H_CHAIN_X         0    alm_hide_chain_note
+ *   H_STEP            d    alm_step_minutes(d), d = -60 -30 -5 5 30 60
  *   H_DAY_PREV / H_DAY_NEXT 0       alm_step_day(-1 / +1)
- *   H_PLAY            0    alm_toggle_play
  *   H_TIMELINE        any  press starts scrubbing: alm_set_time(view_timeline_time(x)),
- *                          saved on release
+ *                          snapped to 5 minutes, saved debounced
  *   H_CAL_PREV / H_CAL_NEXT 0       alm_cal_step (save debounced 250 ms)
- *   H_CAL_TODAY       0    alm_cal_today
+ *   H_CAL_TODAY, H_BACK_TODAY 0     alm_cal_today (back to the party's day and clock)
  *   H_CAL_CELL        k    index into view_cells(); click = alm_select(abs, true),
- *                          double click = alm_set_current(abs)..
+ *                          double click = alm_set_current(abs)
  *   H_UPCOMING        abs  alm_select(abs, false)
  *   H_SET_CURRENT     0    alm_set_current(sel_abs)
  *   H_EV_EDIT         i    index into alm_marks_on(sel_abs): ui_open_form(marks[i].event)
@@ -48,37 +44,38 @@
  *   H_FORM_REPEAT     0    ui_popup_choice under the hit rect -> g.form_repeat
  *   H_FORM_CANCEL / H_FORM_SAVE 0   ui_close_form / ui_form_submit
  *   H_NOTES           0    ui_notes_begin
+ *   H_LEDGER          0    open / close the dice ledger (native.ledger, persisted)
+ *   H_KEYS / H_KEYS_CARD 0 open / close the keyboard shortcuts card
+ *   H_HEAD_NOW        0    back to the weather (scroll to top)
+ *   H_SAVE_FAIL       0    Save dialog for a backup
  *   H_TOAST           0    dismiss the toast
  *   H_SCROLL          0 thumb drag (g.sb_grab = y - thumb top), -1 / +1 page up / down
  *   H_S_*                  settings dialog (handled by ui_settings.c; ignored here)
  *
  * KEYBOARD (main view focused; ignored while a text field has focus) - SPEC 6.2
- *   Right, Space        +1 hour (crossing midnight on today advances the day, lands 00:00)
- *   Left                -1 hour
- *   Home / End          00:00 / 23:00
+ *   Right, Space        +1 hour         Left        -1 hour
+ *   Shift+Right / Left  +-30 minutes    Ctrl+Right / Left  +-5 minutes
+ *                       Forward past midnight on today advances the party (Ctrl+Z steps
+ *                       back); back past 00:00 views the previous day (today stays).
+ *                       Auto-repeat steps the clock but never crosses midnight.
  *   N                   Advance Day (lands at 12:00); Enter never advances (too easy to
  *                       hit twice). Every advance / make-today toasts "Ctrl+Z steps back".
- *   Ctrl+Z, Backspace   one-level undo of the last advance / make-today / midnight step
- *   E / O               new event / write a note for the viewed day (scroll restored after)
- *   F1, ?               keyboard shortcuts card
- *   Right-click a day   popup: view, add event, write a note, make it today
+ *   Ctrl+Z              one-level undo of the last advance / make-today / midnight step
  *   PageUp / PageDown   previous / next day
+ *   T, Esc              back to today (Esc first closes the event form, else the toast)
+ *   E / O               new event / write a note for the viewed day (scroll restored after)
+ *   M                   wind sound
+ *   F2                  Settings         F1   keyboard shortcuts card (any key closes it)
  *   Up / Down           scroll the page; Ctrl+Home / Ctrl+End top / bottom
- *   T today (calendar)  P play/pause  U F/C  M sound  F2 or Ctrl+, Settings
- *   Ctrl+C              copy the seed to the clipboard
- *   Tab / Shift+Tab     move keyboard focus into / out of the calendar grid
- *   Grid focus: arrows move (+-1, +-10, festivals row as calendar.js), Home/End,
- *               Enter/Space select the day, Shift+Enter make it today, Esc/Tab leave.
- *   Esc                 close the event form / keys card, else leave the grid, else hide
- *                       the toast, else return to today.
  * Time-changing keys scroll the page back to the weather. While another day is viewed the
  * party's own clock is kept (g.party_time) and restored on the way back to today.
  *   In EDIT fields: Esc closes the form / leaves the notes (flushed); Enter in Title or
  *   Ctrl+Enter in Details submits; Tab moves between Title and Details; Ctrl+A selects all.
  *
  * TEST HOOKS (documented in native/README.md)
- *   --state <path>  --seed <text>  --days <n>  --select <offset>  --hour <h>
+ *   --state <path>  --seed <text>  --days <n>  --select <offset>  --hour <h>  --minute <m>
  *   --size WxH  --scroll <px>  --open settings|eventform  --shot-ready
+ * The window title is the constant "Icewind Dale Almanac" (+ " [ready]" for --shot-ready).
  */
 #include "ui.h"
 #include "ui_blocks.h"
@@ -91,13 +88,11 @@
 #include <string.h>
 #include <math.h>
 
-/* CONTRACT GAP: provided by ui_view.c (declared there, not in ui.h). */
-
 Ui g;
 
 /* ================================================================== private state */
 
-enum { T_PLAY = 1, T_TOAST, T_NOTE, T_ARM, T_SAVE, T_THUNDER, T_FADE };
+enum { T_TOAST = 1, T_NOTE, T_ARM, T_SAVE, T_THUNDER, T_FADE };
 enum { ID_ED_TITLE = 201, ID_ED_DETAILS, ID_ED_NOTES };
 #define WM_APP_DROP_NOTES (WM_APP + 1)
 #define WM_APP_HOOKS      (WM_APP + 2)
@@ -107,12 +102,9 @@ static bool     s_persist = true;        /* false: --seed without --state (no fi
 static bool     s_save_failed;
 static bool     s_save_pending;          /* a debounced save is scheduled (T_SAVE) */
 static int      s_durable;               /* > 0: ui_apply saves durably at once */
-static WCHAR    s_title[256];            /* last text given to SetWindowTextW */
-static bool     s_title_ready;           /* --shot-ready: first paint done, keep " [ready]" */
-static bool     s_play_timer, s_thunder_timer;
+static bool     s_thunder_timer;
 static int32_t  s_last_sel = INT32_MIN;
 static bool     s_form_scroll;           /* bring the event form into view after the next paint */
-static bool     s_grid_scroll;           /* bring the focused grid cell into view */
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
 static HWND     s_tip_tool_owner;
 static RECT     s_tip_rect;
@@ -127,7 +119,7 @@ static struct { bool ok; int32_t cur_abs; double time; } s_undo;
 /* test hooks */
 static WCHAR   *s_opt_state;
 static char    *s_opt_seed;
-static int      s_opt_days = -1, s_opt_select = INT32_MIN, s_opt_hour = -1;
+static int      s_opt_days = -1, s_opt_select = INT32_MIN, s_opt_hour = -1, s_opt_minute = -1;
 static int      s_opt_w, s_opt_h, s_opt_scroll = -1;
 static int      s_opt_open;              /* 1 settings, 2 eventform */
 static bool     s_opt_shot_ready;
@@ -221,38 +213,6 @@ void ui_apply_durable(AlmResult r)
     s_durable--;
 }
 #define DURABLE(stmt) do { s_durable++; stmt; s_durable--; } while (0)
-
-/* ================================================================== window title */
-
-/* "<date> · HH:00 · <event> <temp>°F — Icewind Dale Almanac", or just the app name before
- * the first day; SetWindowTextW only when the text changed. */
-static void title_sync(void)
-{
-    static const WCHAR k_app[] = L"Icewind Dale Almanac";
-    WCHAR t[256];
-    if (!g.hwnd) return;
-    t[0] = 0;
-    if (alm_has_view(&g.a) && g.a.view >= 0 && g.a.view < g.a.n_days) {
-        AlmHero hr; char d[IWD_DATE_CAP], hh[8], tp[24], u[256];
-        int hour = alm_hour_now(&g.a);
-        const IwdDay *day = &g.a.days[g.a.view];
-        const IwdEventDef *ev;
-        hour = clampi(hour, 0, 23);
-        ev = iwd_event(day->hour_id[hour]);
-        alm_hero(&g.a, &hr);
-        iwd_format_date(hr.abs, true, d, sizeof d);
-        iwd_fmt_hour((int)floor(g.a.time), hh, sizeof hh);
-        iwd_fmt_temp(day->temp_f[hour], g.a.celsius, tp, sizeof tp);
-        snprintf(u, sizeof u, "%s \xC2\xB7 %s \xC2\xB7 %s %s%s \xE2\x80\x94 ", d, hh,
-                 ev && ev->name ? ev->name : "", tp, g.a.celsius ? "C" : "F");
-        if (MultiByteToWideChar(CP_UTF8, 0, u, -1, t, 200) <= 0) t[0] = 0;
-    }
-    lstrcatW(t, k_app);
-    if (s_title_ready) lstrcatW(t, L" [ready]");
-    if (lstrcmpW(t, s_title) == 0) return;
-    lstrcpynW(s_title, t, (int)(sizeof s_title / sizeof s_title[0]));
-    SetWindowTextW(g.hwnd, t);
-}
 
 static bool file_exists(const WCHAR *p)
 {
@@ -846,12 +806,12 @@ LRESULT ui_menu_draw(DRAWITEMSTRUCT *di)
 
 /* ================================================================== settings */
 
-void ui_open_settings(bool focus_seed)
+void ui_open_settings(void)
 {
     ui_notes_flush();
     if (g.ed_notes) notes_drop();
     toast_hide();
-    settings_open(focus_seed);
+    settings_open();
 }
 
 static void state_sync(void);
@@ -869,34 +829,14 @@ void ui_after_settings(bool changed)
         ui_save_now();
     }
     wind_sync(true);
-    title_sync();
     ui_relayout();
     if (g.hwnd && IsWindowEnabled(g.hwnd)) SetFocus(g.hwnd);
 }
 
 /* ================================================================== action results */
 
-static void play_sync(void)
-{
-    if (g.a.playing && !s_play_timer) {
-        g.play_last = GetTickCount64();
-        SetTimer(g.hwnd, T_PLAY, 250, NULL);
-        s_play_timer = true;
-    } else if (!g.a.playing && s_play_timer) {
-        KillTimer(g.hwnd, T_PLAY);
-        s_play_timer = false;
-    }
-}
-
-static int cell_of_sel(void)
-{
-    AlmCell c[32]; int n = view_cells(c), i;
-    for (i = 0; i < n; i++) if (c[i].abs == g.a.sel_abs) return i;
-    return -1;
-}
-
-/* after any state change: day-bound UI (notes EDIT, new-event form, armed delete), the
- * playback timer and the wind */
+/* after any state change: day-bound UI (notes EDIT, new-event form, armed delete) and the
+ * wind */
 static void state_sync(void)
 {
     if (g.a.sel_abs != s_last_sel) {
@@ -908,26 +848,21 @@ static void state_sync(void)
         if (g.notes_abs != g.a.sel_abs) g.note_state = 0;
         if (g.form_open && !g.form_id[0]) ui_close_form();
         if (g.armed_id[0]) { g.armed_id[0] = 0; KillTimer(g.hwnd, T_ARM); }
-        if (g.grid_focus) { int k = cell_of_sel(); if (k >= 0) g.grid_k = k; }
     }
-    play_sync();
     wind_sync(false);
 }
 
 void ui_apply(AlmResult r)
 {
     unsigned fx = r.fx;
-    if (fx & ALM_FX_STOP_BECKON) g.beckon = false;
-    if (fx & ALM_FX_BECKON) g.beckon = true;
     if (fx & ALM_FX_DAY_TOAST) day_toast(r.toast_abs, r.toast_lead);
     if (fx & ALM_FX_TOAST) ui_toast(r.toast);
     if (fx & ALM_FX_RENDER_DAY) view_invalidate_timeline();
     if (fx & (ALM_FX_RENDER_DAY | ALM_FX_RENDER_CAL | ALM_FX_TOAST | ALM_FX_DAY_TOAST)) g.rev++;
     state_sync();
     if (fx & ALM_FX_SAVE) { if (s_durable > 0) ui_save_now(); else save_soon(); }
-    title_sync();
     if (fx & ALM_FX_RENDER_ALL) ui_relayout();
-    else if (fx & (ALM_FX_TOAST | ALM_FX_DAY_TOAST | ALM_FX_BECKON | ALM_FX_STOP_BECKON)) ui_redraw();
+    else if (fx & (ALM_FX_TOAST | ALM_FX_DAY_TOAST)) ui_redraw();
 }
 
 
@@ -940,7 +875,7 @@ typedef struct Pre {
     double  t0;             /* clock before the action */
     int32_t cur0, cur_abs0;
     double  party0;         /* the party's clock (today's time, wherever the view is) */
-    bool    keep_clock;     /* hour stepping: never jump the clock back to the party's */
+    bool    keep_clock;     /* time stepping: never jump the clock back to the party's */
 } Pre;
 
 static double party_clock(void)
@@ -994,10 +929,6 @@ static void post_apply(const Pre *p, AlmResult r)
             s_undo.ok = true; s_undo.cur_abs = p->cur_abs0; s_undo.time = p->party0;
         }
         today_moved_toast(p, &r);
-        if (p->cur0 == 0 && g.a.current == 1 && !g.a.ui.chain_note_hidden) {
-            AlmResult h = alm_hide_chain_note(&g.a);       /* the note has done its job */
-            r.fx |= h.fx & ~(unsigned)(ALM_FX_TOAST | ALM_FX_DAY_TOAST);
-        }
         ui_apply(r);
         if ((r.fx & ALM_FX_DAY_TOAST) && p->cur0 >= 0 && g.toast_on && g.toast_day)
             lstrcpynA(g.toast_hint, "Ctrl+Z steps back to the previous day", (int)sizeof g.toast_hint);
@@ -1007,7 +938,7 @@ static void post_apply(const Pre *p, AlmResult r)
         g.party_time = p->t0;                              /* leaving today: keep its clock */
     } else if (!p->was_today && g.a.current >= 0 && g.a.view == g.a.current) {
         if (g.party_time >= 0 && !p->keep_clock) {
-            AlmResult t = alm_set_time(&g.a, g.party_time, true);
+            AlmResult t = alm_set_time(&g.a, g.party_time);
             if (!(t.fx & ALM_FX_REJECTED)) r.fx |= t.fx;
         }
         g.party_time = -1;
@@ -1041,18 +972,17 @@ static void do_advance(void)
     ACT(alm_advance(&g.a, IWD_SETTLE_HOUR));
 }
 
-static void do_step_hour(int dir)
+/* time step of delta minutes (buttons and arrow keys). A held key (auto-repeat) steps the
+ * clock but never crosses midnight: holding a key cannot run through days. */
+static void do_step(int delta, bool repeat)
 {
+    if (repeat && alm_has_view(&g.a)) {
+        int n = alm_minute_now(&g.a) + delta;
+        if (n < 0 || n >= 1440) return;
+    }
     ui_notes_flush();
     g.fade_req = true;
-    ACTH(alm_step_hour(&g.a, dir));
-}
-
-static void do_set_hour(int h)
-{
-    if (!alm_has_view(&g.a)) return;
-    g.fade_req = true;
-    ACTH(alm_set_time(&g.a, (double)h, true));
+    ACTH(alm_step_minutes(&g.a, delta));
 }
 
 static void do_step_day(int dir)
@@ -1079,50 +1009,25 @@ static void do_set_current(int32_t abs)
 static void do_undo(void)
 {
     AlmResult r, t;
-    char d[IWD_DATE_CAP], ck[16], msg[ALM_TOAST_CAP];
+    char d[IWD_DATE_CAP], msg[ALM_TOAST_CAP];
+    int m;
     if (!s_undo.ok) { ui_toast("Nothing to step back to"); return; }
     s_undo.ok = false;
     ui_notes_flush();
     r = alm_set_current(&g.a, s_undo.cur_abs);
     if (r.fx & ALM_FX_REJECTED) { ui_apply(r); return; }
     r.fx &= ~(unsigned)(ALM_FX_TOAST | ALM_FX_DAY_TOAST);
-    t = alm_set_time(&g.a, s_undo.time, true);
+    t = alm_set_time(&g.a, s_undo.time);
     if (!(t.fx & ALM_FX_REJECTED)) r.fx |= t.fx;
     g.party_time = -1;
     g.fade_req = true;
     iwd_format_date(g.a.current_abs, true, d, sizeof d);
-    iwd_fmt_clock(g.a.time, ck, sizeof ck);
-    snprintf(msg, sizeof msg, "Back to <b>%s</b>, %s", d, ck);
+    m = alm_minute_now(&g.a);
+    snprintf(msg, sizeof msg, "Back to <b>%s</b>, %02d:%02d", d, m / 60, m % 60);
     lstrcpynA(r.toast, msg, ALM_TOAST_CAP);
     r.fx |= ALM_FX_TOAST | ALM_FX_RENDER_ALL | ALM_FX_SAVE;
     ui_apply_durable(r);
     to_weather();
-}
-
-static void copy_seed(void)
-{
-    WCHAR *w; HGLOBAL hg; size_t n;
-    if (!g.a.seed || !OpenClipboard(g.hwnd)) return;
-    w = wz_dup(g.a.seed);
-    if (!w) { CloseClipboard(); return; }
-    n = wcslen(w);
-    hg = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(WCHAR));
-    if (hg) {
-        WCHAR *d = (WCHAR *)GlobalLock(hg);
-        if (d) {
-            memcpy(d, w, (n + 1) * sizeof(WCHAR));
-            GlobalUnlock(hg);
-            EmptyClipboard();
-            if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
-        } else GlobalFree(hg);
-    }
-    CloseClipboard();
-    free(w);
-    {
-        char t[ALM_TOAST_CAP];
-        snprintf(t, sizeof t, "Seed <b>%.200s</b> copied to the clipboard", g.a.seed);
-        ui_toast(t);
-    }
 }
 
 static int32_t cell_abs(int arg, bool *ok)
@@ -1166,7 +1071,7 @@ static void form_repeat_popup(const RECT *hr)
     if (k >= 0) { g.form_repeat = k; ui_redraw(); }
 }
 
-/* shortcut entry points (E, O, right-click): remember where the DM was */
+/* shortcut entry points (E, O): remember where the DM was */
 static void open_form_shortcut(void)
 {
     if (g.saved_scroll < 0) g.saved_scroll = g.scroll;
@@ -1186,44 +1091,32 @@ static void notes_shortcut(void)
     ui_redraw();
 }
 
-static void cell_menu(int k, int sx, int sy)
-{
-    static const char *const lab[4] = { "View this day", "Add event or reminder\xE2\x80\xA6",
-                                        "Write a note", "Make it today" };
-    bool ok; int32_t abs = cell_abs(k, &ok); int c;
-    POINT p;
-    if (!ok) return;
-    p.x = sx; p.y = sy;
-    ClientToScreen(g.hwnd, &p);
-    c = ui_popup_choice(g.hwnd, p.x, p.y, dp(180), lab, 4, -1);
-    if (c < 0) return;
-    if (k >= 0 && k < 32) g.grid_k = k;
-    if (c == 3) { do_set_current(abs); return; }
-    ui_notes_flush();
-    ACT(alm_select(&g.a, abs, true));
-    if (c == 1) open_form_shortcut();
-    else if (c == 2) notes_shortcut();
-}
-
 static void dispatch(int id, int arg, const RECT *hr)
 {
     bool ok;
     stop_fade();
     switch (id) {
-    case H_SEED:          ui_open_settings(true); break;
     case H_UNIT_F:        DURABLE(ACT(alm_set_unit(&g.a, false))); break;
     case H_UNIT_C:        DURABLE(ACT(alm_set_unit(&g.a, true))); break;
     case H_SOUND:         ui_sound_toggle(); break;
     case H_SETTINGS:
-    case H_INTRO_SETTINGS:
-    case H_FOOT_SETTINGS: ui_open_settings(false); break;
+    case H_INTRO_SETTINGS: ui_open_settings(); break;
     case H_ADVANCE:       do_advance(); to_weather(); break;
-    case H_PREV_HOUR:     do_step_hour(-1); break;
-    case H_NEXT_HOUR:     if (g.a.current < 0) do_advance(); else do_step_hour(+1); break;
-    case H_CHAIN_X:       ACT(alm_hide_chain_note(&g.a)); break;
+    case H_STEP:          if (arg == -60 || arg == -30 || arg == -5 || arg == 5 || arg == 30 || arg == 60) do_step(arg, false); break;
     case H_DAY_PREV:      do_step_day(-1); break;
     case H_DAY_NEXT:      do_step_day(+1); break;
-    case H_PLAY:          ACT(alm_toggle_play(&g.a)); break;
+    case H_LEDGER: {
+        g.a.native.ledger = !g.a.native.ledger;
+        save_soon();
+        ui_relayout();
+        if (g.a.native.ledger) {             /* bring it into view, the chip staying on screen */
+            RECT f, l;
+            view_layout();
+            f = view_block_rect(BLK_FOOT); l = view_block_rect(BLK_LEDGER);
+            view_ensure_visible(f.top, l.bottom);
+        }
+        break;
+    }
     case H_CAL_PREV:      ui_apply(alm_cal_step(&g.a, -1)); break;
     case H_CAL_NEXT:      ui_apply(alm_cal_step(&g.a, +1)); break;
     case H_CAL_TODAY:
@@ -1240,7 +1133,6 @@ static void dispatch(int id, int arg, const RECT *hr)
     case H_CAL_CELL: {
         int32_t abs = cell_abs(arg, &ok);
         if (!ok) break;
-        if (arg >= 0 && arg < 32) g.grid_k = arg;
         ui_notes_flush();
         ACT(alm_select(&g.a, abs, true));
         break;
@@ -1353,54 +1245,6 @@ static bool clickable(const Hot *h)
     return h && h->enabled && h->id != H_NONE && h->id != H_TIP;
 }
 
-/* ================================================================== calendar grid keys */
-
-static void grid_enter(void)
-{
-    int k = cell_of_sel();
-    g.grid_focus = true;
-    g.grid_k = k >= 0 ? k : 0;
-    s_grid_scroll = true;
-    ui_redraw();
-}
-
-static void grid_leave(void)
-{
-    if (!g.grid_focus) return;
-    g.grid_focus = false;
-    ui_redraw();
-}
-
-static bool grid_key(WPARAM vk, bool shift)
-{
-    AlmCell c[32]; int n = view_cells(c), k = clampi(g.grid_k, 0, n > 0 ? n - 1 : 0), nk = -1;
-    switch (vk) {
-    case VK_RIGHT: nk = k + 1; break;
-    case VK_LEFT:  nk = k - 1; break;
-    case VK_DOWN:  nk = k < 30 ? (k + 10 < n - 1 ? k + 10 : n - 1) : k; break;
-    case VK_UP:    nk = k >= 30 ? 29 : k - 10; break;
-    case VK_HOME:  nk = 0; break;
-    case VK_END:   nk = n - 1; break;
-    case VK_RETURN:
-        if (n > 0) {
-            ui_notes_flush();
-            if (shift) do_set_current(c[k].abs);
-            else ACT(alm_select(&g.a, c[k].abs, true));
-        }
-        return true;
-    case VK_SPACE:
-        if (n > 0) { ui_notes_flush(); ACT(alm_select(&g.a, c[k].abs, true)); }
-        return true;
-    case VK_ESCAPE: case VK_TAB:
-        grid_leave();
-        return true;
-    default:
-        return false;
-    }
-    if (nk >= 0 && nk < n && nk != g.grid_k) { g.grid_k = nk; s_grid_scroll = true; ui_redraw(); }
-    return true;
-}
-
 /* ================================================================== keyboard */
 
 static int line_px(void) { return dp(48); }
@@ -1412,42 +1256,36 @@ static void on_key(WPARAM vk, LPARAM lp)
     stop_fade();
     if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) return;
     if (vk == VK_F1) { if (!repeat) { g.keys_on = !g.keys_on; ui_redraw(); } return; }
-    if (g.keys_on && vk != VK_OEM_2) {                  /* the keys card: any key closes it */
+    if (g.keys_on) {                                    /* the keys card: any key closes it */
         g.keys_on = false;
         ui_redraw();
         if (vk == VK_ESCAPE) return;
     }
-    if (vk == VK_F2 || (ctrl && vk == VK_OEM_COMMA)) { ui_open_settings(false); return; }
-    if (ctrl && vk == 'C') { copy_seed(); return; }
-    if ((ctrl && vk == 'Z') || (!ctrl && vk == VK_BACK)) { if (!repeat) do_undo(); return; }
+    if (vk == VK_F2) { if (!repeat) ui_open_settings(); return; }
+    if (ctrl && vk == 'Z') { if (!repeat) do_undo(); return; }
     if (ctrl && vk == VK_HOME) { view_scroll_to(0); return; }
     if (ctrl && vk == VK_END) { view_scroll_to(g.content_h); return; }
-    if (g.grid_focus && grid_key(vk, shift)) return;
-    if (ctrl) return;
-    /* one press = one day: auto-repeat only steps hours and scrolls */
-    if (repeat && (vk == 'N' || vk == VK_PRIOR || vk == VK_NEXT || vk == 'T' || vk == 'E' ||
-                   vk == 'O' || vk == 'P' || vk == 'U' || vk == 'M' || vk == VK_TAB || vk == VK_RETURN)) return;
-    switch (vk) {
-    case VK_RIGHT: case VK_SPACE:
-        if (g.a.current < 0) do_advance();              /* intro: the session's keys begin it */
-        else do_step_hour(+1);
+    /* the more modifier, the finer the step: none 1 h, Shift 30 min, Ctrl 5 min */
+    if (vk == VK_RIGHT || vk == VK_LEFT) {
+        int d = ctrl ? 5 : shift ? 30 : 60;
+        do_step(vk == VK_RIGHT ? d : -d, repeat);
         to_weather();
-        break;
-    case VK_LEFT:  do_step_hour(-1); to_weather(); break;
-    case VK_HOME:  do_set_hour(0); to_weather(); break;
-    case VK_END:   do_set_hour(23); to_weather(); break;
+        return;
+    }
+    if (ctrl) return;
+    /* one press = one day: auto-repeat only steps the clock and scrolls */
+    if (repeat && vk != VK_SPACE && vk != VK_UP && vk != VK_DOWN) return;
+    switch (vk) {
+    case VK_SPACE: do_step(60, repeat); to_weather(); break;
     case 'N':      do_advance(); to_weather(); break;
     case VK_PRIOR: do_step_day(-1); to_weather(); break;
     case VK_NEXT:  do_step_day(+1); to_weather(); break;
     case VK_UP:    view_scroll_to(g.scroll - line_px()); break;
     case VK_DOWN:  view_scroll_to(g.scroll + line_px()); break;
     case 'T':      do_today(); to_weather(); break;
-    case 'P':      ACT(alm_toggle_play(&g.a)); break;
-    case 'U':      DURABLE(ACT(alm_set_unit(&g.a, !g.a.celsius))); break;
     case 'M':      ui_sound_toggle(); break;
     case 'E':      if (g.a.sel_abs != INT32_MIN) open_form_shortcut(); break;
     case 'O':      notes_shortcut(); break;
-    case VK_TAB:   grid_enter(); break;
     case VK_ESCAPE:
         if (g.form_open) ui_close_form();
         else if (g.toast_on) toast_hide();
@@ -1551,7 +1389,6 @@ static void restyle_all(void)
 static void close_and_save(void)
 {
     ui_notes_flush();
-    if (g.a.playing) { AlmResult r = alm_toggle_play(&g.a); (void)r; play_sync(); }
     store_placement();
     ui_save_now();
 }
@@ -1562,9 +1399,22 @@ static void run_open_hook(void)
 {
     SetForegroundWindow(g.hwnd);
     SetFocus(g.hwnd);
-    if (s_opt_open == 1) ui_open_settings(false);
+    if (s_opt_open == 1) ui_open_settings();
     else if (s_opt_open == 2) ui_open_form(NULL);
     s_opt_open = 0;
+}
+
+/* ================================================================== scrubbing */
+
+/* timeline drag: the clock follows the pointer in 5-minute steps (00:00 .. 23:55) */
+static void scrub_to(int x, bool first)
+{
+    int m = (int)floor(view_timeline_time(x) * 12 + 0.5) * 5;
+    double t;
+    if (m > 1435) m = 1435;
+    if (m < 0) m = 0;
+    t = m / 60.0;
+    if (first || fabs(t - g.a.time) > 1e-9) ui_apply(alm_set_time(&g.a, t));
 }
 
 /* ================================================================== window proc */
@@ -1602,22 +1452,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             s_form_scroll = false;
             view_ensure_visible(g.rc_title.top - dp(60), IsRectEmpty(&g.rc_details) ? g.rc_title.bottom : g.rc_details.bottom + dp(60));
         }
-        if (s_grid_scroll) {
-            int i;
-            s_grid_scroll = false;
-            for (i = 0; i < g.hl.n; i++) {
-                const Hot *h = &g.hl.items[i];
-                if (h->id == H_CAL_CELL && h->arg == g.grid_k) {
-                    view_ensure_visible(view_content_y(h->r.top), view_content_y(h->r.bottom));
-                    break;
-                }
-            }
-        }
         if (!g.press_id && !g.scrubbing && !g.sb_drag) hover_refresh();
-        if (s_opt_shot_ready) {
+        if (s_opt_shot_ready) {               /* test hook: the first paint is on screen */
             s_opt_shot_ready = false;
-            s_title_ready = true;
-            title_sync();
+            SetWindowTextW(hwnd, L"Icewind Dale Almanac [ready]");
         }
         return 0;
     }
@@ -1656,11 +1494,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g.tracking = TrackMouseEvent(&t) != 0;
         }
         if (g.sb_drag) { view_scroll_to(view_scroll_for_thumb(y)); return 0; }
-        if (g.scrubbing) {
-            double t = view_timeline_time(x);
-            if (fabs(t - g.a.time) > 1e-9) ui_apply(alm_set_time(&g.a, t, true));
-            return 0;
-        }
+        if (g.scrubbing) { scrub_to(x, false); return 0; }
         hover_at(x, y, true);
         return 0;
     }
@@ -1675,11 +1509,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
         const Hot *h = hot_find(&g.hl, x, y);
         Hot hc;
-        if (!h) { if (GetFocus() != hwnd) SetFocus(hwnd); grid_leave(); return 0; }
+        if (!h) { if (GetFocus() != hwnd) SetFocus(hwnd); return 0; }
         hc = *h;
         if (hc.id != H_NOTES && GetFocus() != hwnd && hc.id != H_FORM_TYPE && hc.id != H_FORM_REPEAT) SetFocus(hwnd);
         if (!hc.enabled) return 0;
-        if (hc.id != H_CAL_CELL && hc.id != H_SCROLL && hc.id != H_TOAST && g.grid_focus) grid_leave();
         if (msg == WM_LBUTTONDBLCLK && hc.id == H_CAL_CELL) {
             bool ok; int32_t abs = cell_abs(hc.arg, &ok);
             if (ok) do_set_current(abs);
@@ -1700,7 +1533,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!alm_has_view(&g.a) || g.a.busy) return 0;
             g.scrubbing = true;
             SetCapture(hwnd);
-            ui_apply(alm_set_time(&g.a, view_timeline_time(x), true));
+            scrub_to(x, true);
             ui_redraw();
             return 0;
         }
@@ -1769,36 +1602,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_F10) return 0;
         break;
 
-    case WM_CHAR:                                          /* '?' on any keyboard layout */
-        if (wp == L'?' && !any_edit_focused()) { g.keys_on = !g.keys_on; ui_redraw(); }
-        return 0;
-
-    case WM_RBUTTONUP: {
-        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        const Hot *h = hot_find(&g.hl, x, y);
-        if (h && h->enabled && h->id == H_CAL_CELL) {
-            int k = h->arg;
-            if (GetFocus() != hwnd) SetFocus(hwnd);
-            cell_menu(k, x, y);
-        }
-        return 0;
-    }
-
     case WM_TIMER:
         switch (wp) {
-        case T_PLAY: {
-            ULONGLONG now = GetTickCount64();
-            double dt = (double)(now - g.play_last) / 1000.0 / IWD_SECONDS_PER_HOUR;
-            g.play_last = now;
-            if (!g.a.playing) { play_sync(); break; }
-            if (dt > 2.0) dt = 2.0;
-            {
-                AlmResult r = alm_play_tick(&g.a, dt);
-                if (g.a.playing) r.fx &= ~(unsigned)ALM_FX_SAVE;
-                ui_apply(r);
-            }
-            break;
-        }
         case T_TOAST: KillTimer(hwnd, T_TOAST); if (!g.toast_sticky) toast_hide(); break;
         case T_NOTE:  KillTimer(hwnd, T_NOTE); ui_notes_flush(); break;
         case T_ARM:   KillTimer(hwnd, T_ARM); g.armed_id[0] = 0; ui_redraw(); break;
@@ -1902,10 +1707,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        KillTimer(hwnd, T_PLAY); KillTimer(hwnd, T_TOAST); KillTimer(hwnd, T_NOTE);
-        KillTimer(hwnd, T_ARM); KillTimer(hwnd, T_SAVE); KillTimer(hwnd, T_THUNDER);
-        KillTimer(hwnd, T_FADE);
-        s_play_timer = s_thunder_timer = false;
+        KillTimer(hwnd, T_TOAST); KillTimer(hwnd, T_NOTE); KillTimer(hwnd, T_ARM);
+        KillTimer(hwnd, T_SAVE); KillTimer(hwnd, T_THUNDER); KillTimer(hwnd, T_FADE);
+        s_thunder_timer = false;
         audio_shutdown();
         if (g.tip_hwnd) { DestroyWindow(g.tip_hwnd); g.tip_hwnd = NULL; }
         PostQuitMessage(0);
@@ -1952,6 +1756,7 @@ static void parse_args(void)
         else if (!lstrcmpW(a, L"--days") && parse_int(n, &v, NULL)) { s_opt_days = (int)(v < 0 ? 0 : v > IWD_MAX_DAYS ? IWD_MAX_DAYS : v); i++; }
         else if (!lstrcmpW(a, L"--select") && parse_int(n, &v, NULL)) { s_opt_select = (int)v; i++; }
         else if (!lstrcmpW(a, L"--hour") && parse_int(n, &v, NULL)) { s_opt_hour = (int)(v < 0 ? 0 : v > 23 ? 23 : v); i++; }
+        else if (!lstrcmpW(a, L"--minute") && parse_int(n, &v, NULL)) { s_opt_minute = (int)(v < 0 ? 0 : v > 59 ? 59 : v); i++; }
         else if (!lstrcmpW(a, L"--scroll") && parse_int(n, &v, NULL)) { s_opt_scroll = (int)(v < 0 ? 0 : v); i++; }
         else if (!lstrcmpW(a, L"--size") && parse_int(n, &v, &end) && (*end == L'x' || *end == L'X') &&
                  parse_int(end + 1, &v2, NULL)) {
@@ -2023,8 +1828,10 @@ static void load_state(void)
         }
     }
     if (s_opt_select != INT32_MIN) (void)alm_select(&g.a, g.a.start_abs + s_opt_select, false);
-    if (s_opt_hour >= 0 && alm_has_view(&g.a)) (void)alm_set_time(&g.a, (double)s_opt_hour, true);
-    g.a.playing = false;
+    if ((s_opt_hour >= 0 || s_opt_minute >= 0) && alm_has_view(&g.a)) {
+        int h = s_opt_hour >= 0 ? s_opt_hour : alm_hour_now(&g.a);
+        (void)alm_set_time(&g.a, (h * 60 + (s_opt_minute >= 0 ? s_opt_minute : 0)) / 60.0);
+    }
     g.party_time = -1;
     g.saved_scroll = -1;
     s_last_sel = g.a.sel_abs;
@@ -2104,7 +1911,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         if (s_opt_scroll >= 0) view_scroll_to(s_opt_scroll);
     }
     ui_save_now();                       /* once at boot after load + clean (SPEC 6.3) */
-    title_sync();
     if (s_boot_notice) {
         char t[ALM_TOAST_CAP], n8[MAX_PATH * 3];
         to_utf8(s_bad_name, n8, (int)sizeof n8);

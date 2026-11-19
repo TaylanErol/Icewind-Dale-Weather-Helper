@@ -17,31 +17,29 @@
  * paint share one function (pass) so they never disagree. Nothing animates; repaints happen
  * only on input. The backdrop is dimmed once per open/resize and cached.
  *
- * Layout: two columns (Campaign start, Expedition seed, Year names | Temperature + chained
- * note switch, Advanced, Backup) when the window is wide enough, else one column; then the
- * red confirmation box (when armed) and Cancel / Apply. If the card is taller than the
- * window it scrolls with the mouse wheel and follows keyboard focus.
+ * Layout: two columns (Campaign start, Expedition seed, Year names | Moon, Backup) when the
+ * window is wide enough, else one column; then the red confirmation box (when armed) and
+ * Cancel / Apply. If the card is taller than the window it scrolls with the mouse wheel and
+ * follows keyboard focus. The temperature unit and the web's chained-days note have no
+ * controls here (the header's °F/°C toggle is the unit's one home); Apply writes both back
+ * unchanged.
  *
  * Hit regions (private list, client coordinates of this popup; handled entirely in this
  * file - main.c never sees these ids):
  *   H_S_CLOSE   arg 0   the X in the card head ("Close")          -> discard
  *   H_S_MONTH   arg 0   "Month or festival" select                 -> ui_popup_choice
  *   H_S_RANDOM  arg 0   "Random" (fills a random seed, disarms, focuses the seed)
- *   H_S_UNIT_F  arg 0   °F segment;  H_S_UNIT_C arg 0  °C segment (dialog-local choice)
- *   H_S_CHAIN   arg 0   "Show the chained-days note" switch (dialog-local)
- *   H_S_ADV     arg 0   "Advanced" disclosure (Selûne offset)
  *   H_S_EXPORT  arg 0   "Export backup" (GetSaveFileNameW)
  *   H_S_IMPORT  arg 0   "Import backup" (GetOpenFileNameW)
  *   H_S_CANCEL  arg 0   "Cancel" -> discard
  *   H_S_APPLY   arg 0   "Apply" / "Regenerate weather" -> alm_settings_apply
  *
- * Keyboard: Tab / Shift+Tab cycle in DOM order (X, Day, Month, Year, Seed, Random, Year,
- * Name, unit, switch, Advanced, Selûne offset, Export, Import, Cancel, Apply; disabled Day
- * and the collapsed offset are skipped). Enter in a text field or on the select / unit /
- * switch submits (Apply), on a button activates it; Space activates the focused control;
- * Left/Right/Up/Down switch the unit; Up/Down step the select; Alt+Down / F4 open it;
- * Up/Down in the number fields step by 1 (Day clamped 1..30) or 0.5 (offset, -30..30).
- * Esc closes from anywhere.
+ * Keyboard: Tab / Shift+Tab cycle in reading order (X, Day, Month, Year, Seed, Random,
+ * Year, Name, Selûne offset, Export, Import, Cancel, Apply; a disabled Day is skipped).
+ * Enter in a text field or on the select submits (Apply), on a button activates it; Space
+ * activates the focused control; Up/Down step the select; Alt+Down / F4 open it; Up/Down
+ * in the number fields step by 1 (Day clamped 1..30) or 0.5 (offset, -30..30). Esc closes
+ * from anywhere.
  *
  * Closing: discard -> ui_after_settings(false). Apply DONE -> ui_after_settings(true), then
  * ui_apply(result) (the "Weather regenerated..." toast and flags). Import OK ->
@@ -71,21 +69,17 @@ enum { CMD_CLOSE = 1, CMD_APPLY, CMD_FOCUS_NEXT, CMD_FOCUS_PREV };
 enum { ED_DAY, ED_YEAR, ED_SEED, ED_YN_YEAR, ED_YN_NAME, ED_MOON, ED_COUNT };
 /* focus stops, in the web's DOM order */
 enum { FS_CLOSE, FS_DAY, FS_MONTH, FS_YEAR, FS_SEED, FS_RANDOM, FS_YN_YEAR, FS_YN_NAME,
-       FS_UNIT, FS_CHAIN, FS_ADV, FS_MOON, FS_EXPORT, FS_IMPORT, FS_CANCEL, FS_APPLY,
-       FS_COUNT };
+       FS_MOON, FS_EXPORT, FS_IMPORT, FS_CANCEL, FS_APPLY, FS_COUNT };
 
 static const int k_fs_edit[FS_COUNT] = {
-    -1, ED_DAY, -1, ED_YEAR, ED_SEED, -1, ED_YN_YEAR, ED_YN_NAME, -1, -1, -1, ED_MOON,
-    -1, -1, -1, -1 };
+    -1, ED_DAY, -1, ED_YEAR, ED_SEED, -1, ED_YN_YEAR, ED_YN_NAME, ED_MOON, -1, -1, -1, -1 };
 static const int k_edit_fs[ED_COUNT] = { FS_DAY, FS_YEAR, FS_SEED, FS_YN_YEAR, FS_YN_NAME, FS_MOON };
 
 static const WCHAR k_backup_default[] =
     L"Everything in one JSON file: seed, dates, notes, events and settings.";
-static const WCHAR k_help_start[] =
-    L"The first day of the expedition: weather day 1 and the starting point of the seeded chain.";
+static const WCHAR k_help_start[] = L"Weather day 1.";
 static const WCHAR k_help_seed[] =
-    L"One seed drives the whole campaign. Each new day continues the same chain, and the "
-    L"weather carries over from the previous night.";
+    L"One seed rolls the whole campaign; each day continues from the night before.";
 static const WCHAR k_help_moon[] =
     L"Shifts the moon's phases. Positive values make them arrive later. Canon: full at the "
     L"first midnight of 1 Hammer 1372 DR, 30 days 10½ hours per cycle.";
@@ -111,8 +105,6 @@ static struct {
 
     /* dialog-local values (not applied until Apply) */
     int       option;               /* alm_start_option index */
-    bool      celsius, chain;
-    bool      adv;                  /* "Advanced" expanded (kept across opens, like <details>) */
     bool      armed;                /* confirmation showing */
     bool      err_on;
     WCHAR     err[ALM_TOAST_CAP];
@@ -492,91 +484,21 @@ static int grp_years(int x, int y, int w, bool draw)
     return y + fld_h();
 }
 
-static int grp_temp(int x, int y, int w, bool draw)
+static int grp_moon(int x, int y, int w, bool draw)
 {
-    int segw = dp(50), th = fld_h(), sx, sy, trw = dp(34), trh = dp(18);
-    const WCHAR *swl = L"Show the chained-days note";
-    int need = trw + dp(10) + tw(F_BODY, swl, -1);
-    RECT *u = &D.rs[FS_UNIT], *c = &D.rs[FS_CHAIN];
-    y = group_head(x, y, w, L"Display", NULL, draw);
-    SetRect(u, x, y, x + 2 * segw, y + th);
-    hot_add(x, y, x + segw, y + th, H_S_UNIT_F, 0, true, NULL);
-    hot_add(x + segw, y, x + 2 * segw, y + th, H_S_UNIT_C, 0, true, NULL);
-    if (draw) {
-        int i;
-        px_box(u->left, u->top, u->right, u->bottom, D.field_bg, C_FRAME);
-        for (i = 0; i < 2; i++) {
-            bool on = (i == 1) == D.celsius;
-            bool hot = is_hot(i ? H_S_UNIT_C : H_S_UNIT_F);
-            int a = x + i * segw, b = a + segw;
-            if (on) px_fill(a + 2, y + 2, b - 2, y + th - 2, mix(C_PANEL2, C_ACCENT, 70));
-            else if (hot) px_fill(a + 2, y + 2, b - 2, y + th - 2, mix(D.field_bg, C_PANEL2, 200));
-            tx_center(F_BTN, (a + b) / 2, y + (th - fh(F_BTN)) / 2, i ? L"°C" : L"°F",
-                      on ? C_BRIGHT : hot ? C_TEXT : C_MUTED);
-        }
-        focus_ring(FS_UNIT, u->left, u->top, u->right, u->bottom);
-    }
-    /* switch: beside the toggle when it fits (web .set-split), else below */
-    sx = x + 2 * segw + dp(32);
-    sy = y;
-    if (sx + need > x + w) { sx = x; sy = y + th + dp(14); }
-    SetRect(c, sx, sy, sx + need, sy + th);
-    hot_add(c->left, c->top, c->right, c->bottom, H_S_CHAIN, 0, true, NULL);
-    if (draw) {
-        bool hot = is_hot(H_S_CHAIN);
-        double ty = sy + (th - trh) / 2.0, r = trh / 2.0;
-        DWORD tr = D.chain ? mix(C_PANEL2, C_ACCENT, hot ? 190 : 160) : hot ? C_PANEL2 : D.field_bg;
-        px_fill(sx + (int)r, (int)ty, sx + trw - (int)r, (int)ty + trh, tr);
-        aa_circle(sx + r, ty + r, r, tr, 255);
-        aa_circle(sx + trw - r, ty + r, r, tr, 255);
-        aa_circle(D.chain ? sx + trw - r : sx + r, ty + r, r - fdp(3), D.chain ? C_BRIGHT : C_MUTED, 255);
-        aa_flush();
-        if (!D.chain) {   /* thin outline of the off track */
-            px_fill(sx + (int)r, (int)ty, sx + trw - (int)r, (int)ty + 1, C_FRAME);
-            px_fill(sx + (int)r, (int)ty + trh - 1, sx + trw - (int)r, (int)ty + trh, C_FRAME);
-        }
-        tx(F_BODY, sx + trw + dp(10), sy + (th - fh(F_BODY)) / 2, swl, -1, hot ? C_BRIGHT : C_TEXT);
-        focus_ring(FS_CHAIN, c->left, c->top, c->right, c->bottom);
-    }
-    return (sy + th > y + th ? sy + th : y + th);
-}
-
-static int grp_adv(int x, int y, int w, bool draw)
-{
-    RECT *r = &D.rs[FS_ADV];
-    int sh = dp(26), tw_ = tw(F_BODY_B, L"Advanced", -1);
-    SetRect(r, x, y, x + dp(18) + tw_ + dp(6), y + sh);
-    hot_add(r->left, r->top, r->right, r->bottom, H_S_ADV, 0, true, NULL);
-    if (draw) {
-        bool hot = is_hot(H_S_ADV);
-        DWORD c = hot ? C_BRIGHT : C_ICE;
-        double cx = x + fdp(6), cy = y + sh / 2.0, k = fdp(4);
-        double tri[6];
-        if (D.adv) { tri[0] = cx - k; tri[1] = cy - k * 0.6; tri[2] = cx + k; tri[3] = cy - k * 0.6; tri[4] = cx; tri[5] = cy + k * 0.8; }
-        else       { tri[0] = cx - k * 0.6; tri[1] = cy - k; tri[2] = cx - k * 0.6; tri[3] = cy + k; tri[4] = cx + k * 0.8; tri[5] = cy; }
-        aa_poly(tri, 3, hot ? C_BRIGHT : C_MUTED, 255);
-        aa_flush();
-        tx(F_BODY_B, x + dp(18), y + (sh - fh(F_BODY_B)) / 2, L"Advanced", -1, c);
-        focus_ring(FS_ADV, r->left, r->top, r->right, r->bottom);
-    }
-    y += sh;
-    if (D.adv) {
-        int fw = tw(F_SMALL, k_lbl_moon, -1), hx, hw, hy, h1;
-        if (fw < dp(110)) fw = dp(110);
-        y += dp(10);
-        hx = x + fw + dp(16); hw = x + w - hx;
-        label(x, y, k_lbl_moon, C_SOFT, draw);
-        field(ED_MOON, x, y + lbl_h(), fw, draw);
-        h1 = lbl_h() + fld_h();
-        if (hw >= dp(160)) {
-            int hh = wrap(F_SMALL, hx, y, hw, k_help_moon, C_MUTED, draw);
-            y += h1 > hh ? h1 : hh;
-        } else {
-            hy = y + h1 + dp(8);
-            y = hy + wrap(F_SMALL, x, hy, w, k_help_moon, C_MUTED, draw);
-        }
+    int fw = tw(F_SMALL, k_lbl_moon, -1), hx, hw, hy, h1;
+    y = group_head(x, y, w, L"Moon", NULL, draw);
+    if (fw < dp(110)) fw = dp(110);
+    hx = x + fw + dp(16); hw = x + w - hx;
+    label(x, y, k_lbl_moon, C_SOFT, draw);
+    field(ED_MOON, x, y + lbl_h(), fw, draw);
+    h1 = lbl_h() + fld_h();
+    if (hw >= dp(160)) {
+        int hh = wrap(F_SMALL, hx, y, hw, k_help_moon, C_MUTED, draw);
+        y += h1 > hh ? h1 : hh;
     } else {
-        SetRectEmpty(&D.fld[ED_MOON]);
+        hy = y + h1 + dp(8);
+        y = hy + wrap(F_SMALL, x, hy, w, k_help_moon, C_MUTED, draw);
     }
     return y;
 }
@@ -635,9 +557,7 @@ static int pass(bool draw)
         yl = grp_seed(xl, yl, colw, draw);
         yl = separator(xl, yl, colw, draw);
         yl = grp_years(xl, yl, colw, draw);
-        yr = grp_temp(xr, yr, colw, draw);
-        yr = separator(xr, yr, colw, draw);
-        yr = grp_adv(xr, yr, colw, draw);
+        yr = grp_moon(xr, yr, colw, draw);
         yr = separator(xr, yr, colw, draw);
         yr = grp_backup(xr, yr, colw, draw);
         if (draw) px_fill(xl + colw + gap / 2, y, xl + colw + gap / 2 + 1, (yl > yr ? yl : yr), C_LINE);
@@ -649,9 +569,7 @@ static int pass(bool draw)
         y = separator(xl, y, inner, draw);
         y = grp_years(xl, y, inner, draw);
         y = separator(xl, y, inner, draw);
-        y = grp_temp(xl, y, inner, draw);
-        y = separator(xl, y, inner, draw);
-        y = grp_adv(xl, y, inner, draw);
+        y = grp_moon(xl, y, inner, draw);
         y = separator(xl, y, inner, draw);
         y = grp_backup(xl, y, inner, draw);
     }
@@ -801,7 +719,6 @@ static void CALLBACK owner_moved(HWINEVENTHOOK hk, DWORD ev, HWND hwnd, LONG obj
 static bool stop_ok(int s)
 {
     if (s == FS_DAY) return D.ed[ED_DAY] && IsWindowEnabled(D.ed[ED_DAY]);
-    if (s == FS_MOON) return D.adv && D.ed[ED_MOON];
     if (k_fs_edit[s] >= 0) return D.ed[k_fs_edit[s]] != NULL;
     return true;
 }
@@ -895,15 +812,13 @@ static void fill_year_name(void)
 static void read_form(AlmSettingsForm *f)
 {
     char *t;
-    memset(f, 0, sizeof *f);
+    alm_settings_fill(&g.a, f);         /* unit and chained-days note: written back unchanged */
     f->start_day = (int)field_int(ED_DAY, &f->start_day_valid);
     f->start_option = D.option;
     f->start_year = field_int(ED_YEAR, &f->start_year_valid);
     t = edit_text(ED_SEED); copy_u8(f->seed, sizeof f->seed, t); free(t);
     f->yn_year = field_int(ED_YN_YEAR, &f->yn_year_valid);
     t = edit_text(ED_YN_NAME); copy_u8(f->yn_name, sizeof f->yn_name, t); free(t);
-    f->celsius = D.celsius;
-    f->show_chain_note = D.chain;
     f->moon_offset = field_float(ED_MOON, &f->moon_offset_valid);
     f->now_ms = ui_now_ms();
 }
@@ -1040,14 +955,6 @@ static void activate(int id)
     case H_S_CLOSE: case H_S_CANCEL: close_dialog(false, NULL, NULL); break;
     case H_S_APPLY:  do_apply(); break;
     case H_S_RANDOM: do_random(); break;
-    case H_S_UNIT_F: D.celsius = false; redraw(); break;
-    case H_S_UNIT_C: D.celsius = true; redraw(); break;
-    case H_S_CHAIN:  D.chain = !D.chain; redraw(); break;
-    case H_S_ADV:
-        D.adv = !D.adv;
-        if (!D.adv && GetFocus() == D.ed[ED_MOON]) set_focus_stop(FS_ADV, true, false);
-        relayout();
-        break;
     case H_S_EXPORT: do_export(); break;
     case H_S_IMPORT: do_import(); break;
     case H_S_MONTH:  open_month_popup(); break;
@@ -1061,9 +968,6 @@ static int stop_of_hot(int id)
     case H_S_CLOSE: return FS_CLOSE;
     case H_S_MONTH: return FS_MONTH;
     case H_S_RANDOM: return FS_RANDOM;
-    case H_S_UNIT_F: case H_S_UNIT_C: return FS_UNIT;
-    case H_S_CHAIN: return FS_CHAIN;
-    case H_S_ADV: return FS_ADV;
     case H_S_EXPORT: return FS_EXPORT;
     case H_S_IMPORT: return FS_IMPORT;
     case H_S_CANCEL: return FS_CANCEL;
@@ -1157,8 +1061,6 @@ static void fill_from_state(void)
     set_text(ED_MOON, wz(b));
     D.option = clampi(f.start_option, 0, ALM_START_OPTION_COUNT - 1);
     if (D.ed[ED_DAY]) EnableWindow(D.ed[ED_DAY], !option_is_festival(D.option));
-    D.celsius = f.celsius;
-    D.chain = f.show_chain_note;
     D.armed = false;
     D.err_on = false;
     D.err[0] = 0;
@@ -1198,7 +1100,7 @@ static void create_edits(void)
         SendMessageW(D.ed[ED_YN_NAME], EM_SETCUEBANNER, FALSE, (LPARAM)k_yn_placeholder);
 }
 
-void settings_open(bool focus_seed)
+void settings_open(void)
 {
     RECT cr; POINT p = { 0, 0 };
     ui_notes_flush();                   /* web: cal.flushNote() */
@@ -1227,8 +1129,7 @@ void settings_open(bool focus_seed)
     EnableWindow(g.hwnd, FALSE);
     ShowWindow(D.hwnd, SW_SHOW);
     SetForegroundWindow(D.hwnd);
-    if (focus_seed) set_focus_stop(FS_SEED, true, true);
-    else set_focus_stop(option_is_festival(D.option) ? FS_MONTH : FS_DAY, true, false);
+    set_focus_stop(option_is_festival(D.option) ? FS_MONTH : FS_DAY, true, false);
 }
 
 void settings_fonts_changed(void)
@@ -1290,15 +1191,9 @@ static void on_key(WPARAM vk, bool alt)
         if (vk == VK_HOME) { set_option(0); return; }
         if (vk == VK_END) { set_option(ALM_START_OPTION_COUNT - 1); return; }
     }
-    if (s == FS_UNIT) {
-        if (vk == VK_LEFT || vk == VK_UP)    { D.celsius = false; D.foc_vis = true; redraw(); return; }
-        if (vk == VK_RIGHT || vk == VK_DOWN) { D.celsius = true; D.foc_vis = true; redraw(); return; }
-        if (vk == VK_SPACE) return;           /* already checked */
-    }
     if (vk == VK_SPACE) {
         static const int ids[FS_COUNT] = { H_S_CLOSE, 0, H_S_MONTH, 0, 0, H_S_RANDOM, 0, 0, 0,
-                                           H_S_CHAIN, H_S_ADV, 0, H_S_EXPORT, H_S_IMPORT,
-                                           H_S_CANCEL, H_S_APPLY };
+                                           H_S_EXPORT, H_S_IMPORT, H_S_CANCEL, H_S_APPLY };
         if (s >= 0 && s < FS_COUNT && ids[s]) activate(ids[s]);
         return;
     }
@@ -1306,7 +1201,6 @@ static void on_key(WPARAM vk, bool alt)
         switch (s) {
         case FS_CLOSE: activate(H_S_CLOSE); break;
         case FS_RANDOM: activate(H_S_RANDOM); break;
-        case FS_ADV: activate(H_S_ADV); break;
         case FS_EXPORT: activate(H_S_EXPORT); break;
         case FS_IMPORT: activate(H_S_IMPORT); break;
         case FS_CANCEL: activate(H_S_CANCEL); break;

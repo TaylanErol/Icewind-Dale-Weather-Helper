@@ -1245,8 +1245,7 @@ static void parse_native(const JVal *nv, AlmNative *n)
     const JVal *v;
     if ((v = jget(nv, "sound"))) n->sound = v->t == J_TRUE;
     if ((v = jget(nv, "maximized"))) n->maximized = v->t == J_TRUE;
-    int32_t t;
-    if (j_int(jget(nv, "tab"), 0, 64, &t)) n->tab = t;
+    if ((v = jget(nv, "ledger"))) n->ledger = v->t == J_TRUE;
     int32_t x, y, w, h;
     if (j_int(jget(nv, "x"), -1e6, 1e6, &x) && j_int(jget(nv, "y"), -1e6, 1e6, &y) &&
         j_int(jget(nv, "w"), 1, 1e6, &w) && j_int(jget(nv, "h"), 1, 1e6, &h)) {
@@ -1415,7 +1414,7 @@ static void write_snapshot(const Almanac *a, JW *w, const char *exported_iso, bo
         jw_begin(w, '{');
         jw_key(w, "sound"); jw_bool(w, n->sound);
         jw_key(w, "maximized"); jw_bool(w, n->maximized);
-        jw_key(w, "tab"); jw_int(w, n->tab);
+        jw_key(w, "ledger"); jw_bool(w, n->ledger);
         if (n->has_rect) {
             jw_key(w, "x"); jw_int(w, n->win_x);
             jw_key(w, "y"); jw_int(w, n->win_y);
@@ -1561,7 +1560,6 @@ AlmImportStatus alm_import_json(Almanac *a, const char *json, size_t len, double
     if (!build_state(a, &root, NULL)) { jfree(&root); return ALM_IMPORT_NO_MEMORY; }
     const JVal *st = jget(&root, "started");
     a->started = (j_num(st) && st->num != 0 && !isnan(st->num)) ? st->num : now_ms;
-    a->playing = false;
     jfree(&root);
     return ALM_IMPORT_OK;
 }
@@ -1746,6 +1744,14 @@ int alm_hour_now(const Almanac *a)
     return f < 0 ? 0 : f > 23 ? 23 : (int)f;
 }
 
+int alm_minute_now(const Almanac *a)
+{
+    int h = alm_hour_now(a);
+    double f = floor((a->time - h) * 60 + 1e-6);
+    int m = isnan(f) || f < 0 ? 0 : f > 59 ? 59 : (int)f;
+    return h * 60 + m;
+}
+
 bool alm_has_view(const Almanac *a) { return a->n_days > 0 && a->view >= 0 && a->view < a->n_days; }
 
 int alm_event_at(const Almanac *a, int32_t v, int hour)
@@ -1815,7 +1821,6 @@ AlmResult alm_advance(Almanac *a, double land_time)
     if (a->busy || target >= IWD_MAX_DAYS) return rejected();
     if (!alm_ensure_days(a, target + 1)) return rejected();
     AlmResult r = res0();
-    a->playing = false;
     if (!(land_time >= 0 && land_time < 24)) land_time = IWD_SETTLE_HOUR;
     a->current = target;
     a->has_current_abs = true;
@@ -1824,7 +1829,7 @@ AlmResult alm_advance(Almanac *a, double land_time)
     a->sel_abs = a->current_abs;
     a->time = land_time;
     show_month_of(a, a->sel_abs);
-    r.fx = ALM_FX_SAVE | ALM_FX_RENDER_ALL | ALM_FX_ANNOUNCE | ALM_FX_STOP_BECKON;
+    r.fx = ALM_FX_SAVE | ALM_FX_RENDER_ALL | ALM_FX_ANNOUNCE;
     r.toast_abs = a->current_abs;
     r.toast_lead = first ? "The expedition begins" : "Today";
     if (alm_marks_on(a, a->current_abs, NULL, 0) > 0) r.fx |= ALM_FX_DAY_TOAST;
@@ -1892,7 +1897,7 @@ AlmResult alm_set_current(Almanac *a, int32_t abs)
     a->view = (int32_t)i;
     a->sel_abs = abs;
     show_month_of(a, abs);
-    r.fx = ALM_FX_STOP_BECKON | ALM_FX_RENDER_ALL | ALM_FX_SAVE | ALM_FX_ANNOUNCE;
+    r.fx = ALM_FX_RENDER_ALL | ALM_FX_SAVE | ALM_FX_ANNOUNCE;
     r.toast_abs = abs;
     r.toast_lead = "Today is now";
     if (alm_marks_on(a, abs, NULL, 0) > 0) r.fx |= ALM_FX_DAY_TOAST;
@@ -1911,92 +1916,45 @@ AlmResult alm_step_day(Almanac *a, int dir)
     return alm_select(a, alm_abs_of(a, (int32_t)i), false);
 }
 
-AlmResult alm_set_time(Almanac *a, double t, bool stop_playing)
+AlmResult alm_set_time(Almanac *a, double t)
 {
     if (!alm_has_view(a) || isnan(t)) return rejected();
     AlmResult r = res0();
     if (t < 0) t = 0;
     if (t > 23.9999) t = 23.9999;
     a->time = t;
-    if (stop_playing) a->playing = false;
     r.fx = ALM_FX_RENDER_HOUR | ALM_FX_SAVE;
     return r;
 }
 
-AlmResult alm_step_hour(Almanac *a, int dir)
+AlmResult alm_step_minutes(Almanac *a, int delta)
 {
-    if (a->busy || !alm_has_view(a) || dir == 0) return rejected();
-    int h = alm_hour_now(a);
+    if (a->busy || !alm_has_view(a) || delta == 0 || delta >= 1440 || delta <= -1440) return rejected();
+    int n = alm_minute_now(a) + delta;
     AlmResult r;
-    if (dir > 0) {
-        if (h < 23) {
-            r = res0();
-            a->time = h + 1;
-            r.fx = ALM_FX_RENDER_HOUR;
-        } else if (a->view != a->current) {
+    if (n >= 0 && n < 1440) {
+        r = res0();
+        a->time = n / 60.0;
+    } else if (n >= 1440) {
+        double land = (n - 1440) / 60.0;
+        if (a->view != a->current) {
             int64_t i = (int64_t)a->view + 1;
             if (i >= IWD_MAX_DAYS) return rejected();
             r = alm_select(a, alm_abs_of(a, (int32_t)i), false);
             if (r.fx & ALM_FX_REJECTED) return r;
-            a->time = 0;
+            a->time = land;
         } else {
-            r = alm_advance(a, 0);
+            r = alm_advance(a, land);
             if (r.fx & ALM_FX_REJECTED) return r;
         }
+    } else if (a->view > 0) {
+        r = alm_select(a, alm_abs_of(a, a->view - 1), false);
+        if (r.fx & ALM_FX_REJECTED) return r;
+        a->time = (n + 1440) / 60.0;
     } else {
-        if (h > 0) {
-            r = res0();
-            a->time = h - 1;
-            r.fx = ALM_FX_RENDER_HOUR;
-        } else if (a->view > 0) {
-            r = alm_select(a, alm_abs_of(a, a->view - 1), false);
-            if (r.fx & ALM_FX_REJECTED) return r;
-            a->time = 23;
-        } else {
-            return rejected();
-        }
+        return rejected();
     }
-    a->playing = false;
     r.fx |= ALM_FX_ANNOUNCE | ALM_FX_SAVE | ALM_FX_RENDER_HOUR;
-    return r;
-}
-
-AlmResult alm_toggle_play(Almanac *a)
-{
-    if (a->busy || !alm_has_view(a)) return rejected();
-    AlmResult r = res0();
-    if (!a->playing && a->time >= 23.9) a->time = 0;
-    a->playing = !a->playing;
-    r.fx = ALM_FX_RENDER_HOUR;
-    /* pausing settles the party clock on the whole hour it is in (rules are per hour);
-     * a deliberate deviation from the web, which keeps the fraction */
-    if (!a->playing) { a->time = floor(a->time); r.fx |= ALM_FX_SAVE; }
-    return r;
-}
-
-AlmResult alm_play_tick(Almanac *a, double dt_hours)
-{
-    AlmResult r = res0();
-    if (!a->playing || a->busy || !alm_has_view(a) || !(dt_hours > 0)) return r;
-    if (dt_hours > 24) dt_hours = 24;
-    a->time += dt_hours;
-    r.fx = ALM_FX_RENDER_HOUR;
-    if (a->time >= 24) {
-        int32_t limit = a->view <= a->current ? a->current : a->n_days - 1;
-        if (a->view < limit) {
-            a->time -= 24;
-            if (a->time >= 24) a->time = 23.99;
-            a->view++;
-            a->sel_abs = alm_abs_of(a, a->view);
-            show_month_of(a, a->sel_abs);
-            r.fx |= ALM_FX_RENDER_ALL;
-        } else {
-            a->time = 23.99;
-            a->playing = false;
-            r.fx |= ALM_FX_SAVE;
-            if (a->view == a->current) r.fx |= ALM_FX_BECKON;
-        }
-    }
     return r;
 }
 
@@ -2005,14 +1963,6 @@ AlmResult alm_set_unit(Almanac *a, bool celsius)
     AlmResult r = res0();
     a->celsius = celsius;
     r.fx = ALM_FX_RENDER_ALL | ALM_FX_SAVE;
-    return r;
-}
-
-AlmResult alm_hide_chain_note(Almanac *a)
-{
-    AlmResult r = res0();
-    a->ui.chain_note_hidden = true;
-    r.fx = ALM_FX_RENDER_DAY | ALM_FX_SAVE;
     return r;
 }
 
@@ -2030,7 +1980,6 @@ AlmResult alm_cal_step(Almanac *a, int dir)
     return r;
 }
 
-void alm_cal_show_month_of(Almanac *a, int32_t abs) { show_month_of(a, abs); }
 
 AlmResult alm_cal_today(Almanac *a)
 {
@@ -2138,7 +2087,6 @@ bool alm_regenerate(Almanac *a, int32_t start_abs, const char *seed, double now_
     if (!ns) return false;
     bool has_target = a->has_current_abs;
     int32_t target = a->current_abs;
-    a->playing = false;
     free(a->seed);
     a->seed = ns;
     a->start_abs = start_abs;
@@ -2702,35 +2650,18 @@ void alm_controls(const Almanac *a, AlmControls *out)
     if (a->current < 0) {
         fmt_date(a->start_abs, false, d);
         fmt_into(out->main, sizeof out->main, "Begin the Expedition");
-        fmt_into(out->sub, sizeof out->sub, "d12 opens %s", d);
         out->advance_enabled = !a->busy;
     } else if (a->current + 1 >= IWD_MAX_DAYS) {
         fmt_into(out->main, sizeof out->main, "The Almanac Is Full");
-        fmt_into(out->sub, sizeof out->sub, "%d days recorded", IWD_MAX_DAYS);
         out->advance_enabled = false;
     } else {
         fmt_date(alm_abs_of(a, a->current + 1), true, d);
         fmt_into(out->main, sizeof out->main, "Advance to %s", d);
-        if (a->current < a->n_days) {
-            const IwdActive *c = &a->days[a->current].carry_out;
-            const IwdEventDef *ev = iwd_event(c->id);
-            if (c->elapsed > 0)
-                fmt_into(out->sub, sizeof out->sub, "%s carries on \xC2\xB7 %d h left", ev ? ev->name : "",
-                         (int)c->duration - (int)c->elapsed);
-            else
-                fmt_into(out->sub, sizeof out->sub, "%s rolls in at midnight", ev ? ev->name : "");
-        }
         out->advance_enabled = !a->busy;
     }
     int32_t v = a->view;
     out->prev_enabled = !a->busy && v > 0;
     out->next_enabled = !a->busy && v >= 0 && v + 1 < IWD_MAX_DAYS;
-    if (v >= 0) {
-        fmt_date(alm_abs_of(a, v), true, d);
-        fmt_into(out->day_nav, sizeof out->day_nav, "%s \xC2\xB7 Day %ld", d, (long)v + 1);
-    } else {
-        fmt_into(out->day_nav, sizeof out->day_nav, "No days yet");
-    }
 }
 
 size_t alm_fmt_announce(const Almanac *a, char *buf, size_t cap)

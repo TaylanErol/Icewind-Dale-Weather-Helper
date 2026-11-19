@@ -20,7 +20,6 @@ HotList *g_hl;
 typedef struct { UINT32 GdiplusVersion; void *DebugEventCallback; BOOL SuppressBackgroundThread; BOOL SuppressExternalCodecs; } GpStartupInput;
 typedef struct { UINT Width, Height; INT Stride; INT PixelFormat; void *Scan0; UINT_PTR Reserved; } GpBitmapData;
 typedef struct { INT X, Y, Width, Height; } GpRectI;
-typedef struct { float X, Y; } GpPointF;
 int  WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupInput *input, void *output);
 void WINAPI GdiplusShutdown(ULONG_PTR token);
 int  WINAPI GdipCreateBitmapFromStream(IStream *stream, void **bitmap);
@@ -45,8 +44,6 @@ int  WINAPI GdipCreatePath(int fill_mode, void **path);
 int  WINAPI GdipResetPath(void *path);
 int  WINAPI GdipDeletePath(void *path);
 int  WINAPI GdipAddPathArc(void *path, float x, float y, float w, float h, float start, float sweep);
-int  WINAPI GdipAddPathLine(void *path, float x1, float y1, float x2, float y2);
-int  WINAPI GdipAddPathPolygon(void *path, const GpPointF *pts, INT n);
 int  WINAPI GdipClosePathFigure(void *path);
 int  WINAPI GdipFillPath(void *g, void *brush, void *path);
 int  WINAPI GdipFillEllipse(void *g, void *brush, float x, float y, float w, float h);
@@ -220,16 +217,6 @@ void px_copy(const DWORD *src, int sw, int sh, int dx, int dy)
         memcpy(g_tgt->px + (size_t)y * g_tgt->w + x0, src + (size_t)(y - dy) * sw + (x0 - dx), sizeof(DWORD) * (size_t)(x1 - x0));
 }
 
-void px_copy_dim(const DWORD *src, int sw, int sh, int dx, int dy, int keep)
-{
-    int x, y, x0 = dx, y0 = dy, x1 = dx + sw, y1 = dy + sh;
-    if (!src || !clip(&x0, &y0, &x1, &y1)) return;
-    for (y = y0; y < y1; y++) {
-        DWORD *d = g_tgt->px + (size_t)y * g_tgt->w; const DWORD *s = src + (size_t)(y - dy) * sw - dx;
-        for (x = x0; x < x1; x++) d[x] = mix(C_BG, s[x], keep);
-    }
-}
-
 /* ================================================================== fonts */
 
 static int g_ascent[F_COUNT];
@@ -266,7 +253,6 @@ void fonts_make(void)
     g.font[F_UNIT]    = mkfont(L"Segoe UI Light", 24, FW_LIGHT, FALSE);
     g.font[F_BTN]     = mkfont(L"Segoe UI Semibold", 13, FW_SEMIBOLD, FALSE);
     g.font[F_BTN_BIG] = mkfont(L"Segoe UI Semibold", 17, FW_SEMIBOLD, FALSE);
-    g.font[F_H]       = mkfont(L"Segoe UI Semibold", 12, FW_SEMIBOLD, FALSE);
     g.font[F_MONTH]   = mkfont(L"Georgia", 22, FW_NORMAL, FALSE);
     g.font[F_MONO]    = mkfont(L"Consolas", 13, FW_NORMAL, FALSE);
     g.font[F_VALUE]   = mkfont(L"Segoe UI Semibold", 16, FW_SEMIBOLD, FALSE);
@@ -554,18 +540,6 @@ void aa_line(double x0, double y0, double x1, double y1, DWORD c, int alpha, dou
     GdipSetPenColor(g_pen, argb(c, alpha));
     GdipSetPenWidth(g_pen, (float)width);
     GdipDrawLine(g_tgt->gfx, g_pen, (float)x0, (float)y0, (float)x1, (float)y1);
-}
-
-void aa_poly(const double *xy, int n, DWORD c, int alpha)
-{
-    GpPointF pts[64]; int i;
-    if (!aa_ok() || n < 3 || n > 64) return;
-    GdiFlush();
-    for (i = 0; i < n; i++) { pts[i].X = (float)xy[2 * i]; pts[i].Y = (float)xy[2 * i + 1]; }
-    GdipResetPath(g_path);
-    GdipAddPathPolygon(g_path, pts, n);
-    GdipSetSolidFillColor(g_brush, argb(c, alpha));
-    GdipFillPath(g_tgt->gfx, g_brush, g_path);
 }
 
 /* A six-armed frost mark (new moon / sacrifice to Auril): three thin crossing strokes. */

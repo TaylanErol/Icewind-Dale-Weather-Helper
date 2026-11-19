@@ -6,20 +6,22 @@
  *   BLK_TIMELINE: the static part (cycle bands, temperature trace with grid and labels, the
  *   segment bar made of scene-image slices, hour ticks) is composed once into a private
  *   Surface (DIB + GDI+), keyed by (almanac epoch, view, unit, size, dpi). Every paint just
- *   copies it and draws the live parts on top: head row (navigator, play), playhead line,
- *   knob, time label, the chart dot, hover outline and the scrub ring. Moving the playhead
- *   therefore costs one memcpy of the strip plus a few primitives.
- *   BLK_LEDGER: plain rich text, drawn directly (a day has at most ~25 rows).
+ *   copies it and draws the live parts on top: head row (title, previous / next day),
+ *   playhead line, knob, the chart dot, hover outline and, while scrubbing, the scrub ring
+ *   and the HH:MM label. Moving the playhead therefore costs one memcpy of the strip plus a
+ *   few primitives. The block is only laid out once there is weather (not before the first
+ *   dawn).
+ *   BLK_LEDGER: plain rich text, drawn directly (a day has at most ~25 rows). It is laid out
+ *   under the footer and only while the footer's dice chip has it open (native.ledger).
  *
  * Hit regions registered here (all in back-buffer coordinates, already scrolled):
  *   H_DAY_PREV  arg 0        previous day (alm_step_day(-1)); disabled per alm_controls
  *   H_DAY_NEXT  arg 0        next day (alm_step_day(+1)); disabled per alm_controls
- *   H_PLAY      arg 0        play / pause (alm_toggle_play); tip "Play the day" / "Pause"
  *   H_TIMELINE  arg i >= 0   segment i of the viewed day (index into IwdDay.segments) on
- *                            the bar; tip = the web's segment tooltip
+ *                            the bar; tip "<name> · HH:00–HH:00 (D h)" (+ continuations)
  *               arg -1       the temperature trace / tick area above and below the bar
- *               Both start scrubbing: time = view_timeline_time(mouse x); enabled only
- *               when a day is on screen and nothing is busy.
+ *               Both start scrubbing (main.c snaps to 5 minutes); enabled only when a day
+ *               is on screen and nothing is busy.
  *   The ledger registers no hit regions.
  *
  * Deviations from the web (documented for the integrator):
@@ -243,15 +245,13 @@ static void bar_segment(const TlGeom *G, int ox, int oy, const IwdSegment *s, in
             }
         }
     }
-    /* tooltip: "<name> · HH:00–HH:00 · Xd4 [r1+r2] = D h[ · continues ...]" */
+    /* tooltip: "<name> · HH:00–HH:00 (D h)[ · continues ...]" (the dice: ledger only) */
     {
-        char a[8], b[8], rolls[16], t[256];
+        char a[8], b[8], t[256];
         iwd_fmt_hour(s->start, a, sizeof a);
         if (s->end >= 24) strcpy(b, "24:00"); else iwd_fmt_hour(s->end, b, sizeof b);
-        if (s->n_rolls >= 2) snprintf(rolls, sizeof rolls, "%d+%d", s->rolls[0], s->rolls[1]);
-        else snprintf(rolls, sizeof rolls, "%d", s->rolls[0]);
-        snprintf(t, sizeof t, "%s \xC2\xB7 %s\xE2\x80\x93%s \xC2\xB7 %dd4 [%s] = %d h%s%s",
-                 ev ? ev->name : "?", a, b, ev ? ev->dice : s->n_rolls, rolls, s->duration,
+        snprintf(t, sizeof t, "%s \xC2\xB7 %s\xE2\x80\x93%s (%d h)%s%s",
+                 ev ? ev->name : "?", a, b, s->duration,
                  s->from_prev_day ? " \xC2\xB7 continues from the previous day" : "",
                  s->into_next_day ? " \xC2\xB7 continues into the next day" : "");
         w8(t, s_seg_tip[i], 200);
@@ -403,11 +403,6 @@ static void strip_build(const TlGeom *G, const IwdDay *d)
         chart(G, ox, oy, d);
         s_nseg = d->n_segments;
         for (i = 0; i < d->n_segments; i++) bar_segment(G, ox, oy, &d->segments[i], i, true);
-    } else {
-        const WCHAR *e = L"No days recorded yet — begin the expedition.";
-        int ew = tw(F_SMALL, e, -1);
-        if (ew <= bx1 - bx0) tx(F_SMALL, (bx0 + bx1 - ew) / 2, (by0 + by1 - fh(F_SMALL)) / 2, e, -1, C_DIM);
-        else tx_ellipsis(F_SMALL, bx0 + dp(6), (by0 + by1 - fh(F_SMALL)) / 2, bx1 - bx0 - dp(12), e, C_DIM);
     }
     px_frame(bx0, by0, bx1, by1, 1, mix(C_PANEL, 0xC8EBFF, 41));
     ticks(G, ox, oy);
@@ -432,62 +427,33 @@ static void strip_ensure(const TlGeom *G)
 
 /* ================================================================== timeline: live parts */
 
-static void button(int x0, int y0, int x1, int y1, int id, bool en, const WCHAR *label, const WCHAR *tip, int glyph)
+static void button(int x0, int y0, int x1, int y1, int id, bool en, const WCHAR *label, const WCHAR *tip)
 {
-    bool hot = g.hot_id == id, press = hot && g.press_id == id && en;
+    bool hot = en && g.hot_id == id, press = hot && g.press_id == id;
     DWORD fill = !en ? mix(C_PANEL, C_PANEL2, 120) : press ? C_FIELD : hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2;
     DWORD border = !en ? C_LINE : hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME;
-    DWORD ink = en ? C_BRIGHT : C_DIM;
-    int lw = label ? tw(F_BTN, label, -1) : 0, gw = glyph ? dp(10) : 0, gap = (glyph && label) ? dp(6) : 0;
-    int cx = (x0 + x1 - (lw + gw + gap)) / 2, cy = (y0 + y1) / 2;
     px_box(x0, y0, x1, y1, fill, border);
-    if (glyph == 1) {                       /* play */
-        double xy[6];
-        xy[0] = cx; xy[1] = cy - dp(5); xy[2] = cx + dp(9); xy[3] = cy; xy[4] = cx; xy[5] = cy + dp(5);
-        aa_poly(xy, 3, ink, 255);
-        aa_flush();
-    } else if (glyph == 2) {                /* pause */
-        int bw = dp(3) < 2 ? 2 : dp(3);
-        px_fill(cx + dp(1), cy - dp(5), cx + dp(1) + bw, cy + dp(5), ink);
-        px_fill(cx + dp(6), cy - dp(5), cx + dp(6) + bw, cy + dp(5), ink);
-    }
-    if (label) tx(F_BTN, cx + gw + gap, cy - fh(F_BTN) / 2, label, -1, ink);
+    tx_center(F_BTN, (x0 + x1) / 2, (y0 + y1 - fh(F_BTN)) / 2, label, en ? C_BRIGHT : C_DIM);
     hot_add(x0, y0, x1, y1, id, 0, en, tip);
 }
 
+/* head: title left; "‹ Previous day" / "Next day ›" right (glyphs only in a narrow block).
+ * The date is the hero's; the clock is the controls'. */
 static void tl_head(const TlGeom *G)
 {
     AlmControls c;
-    WCHAR nav[96];
-    int bh = dp(26), by = G->head_y + (G->head_h - bh) / 2;
-    int xr = G->x + G->w - G->pad, play_w = dp(96), ab = dp(28), lab_w, xl;
-    bool can_play = tl_interactive();
+    int bh = dp(26), by = G->head_y + (G->head_h - bh) / 2, xr = G->x + G->w - G->pad, gap = dp(6);
+    bool full = G->w >= dp(520);
+    const WCHAR *lp = full ? L"\x2039  Previous day" : L"\x2039", *ln = full ? L"Next day  \x203A" : L"\x203A";
+    int wp = full ? tw(F_BTN, lp, -1) + dp(22) : dp(28), wn = full ? tw(F_BTN, ln, -1) + dp(22) : dp(28);
     alm_controls(&g.a, &c);
-    w8(c.day_nav, nav, 96);
-    lab_w = tw(F_SMALL_B, nav, -1) + dp(16);
-    if (lab_w < dp(150)) lab_w = dp(150);
-    /* play / pause */
-    button(xr - play_w, by, xr, by + bh, H_PLAY, can_play,
-           g.a.playing ? L"Pause" : L"Play", g.a.playing ? L"Pause (P)" : L"Play the day (P)", g.a.playing ? 2 : 1);
-    {   /* key cap at the button's right end */
-        int kw = tw(F_TINY_B, L"P", -1) + dp(8), kx = xr - dp(6) - kw, ky = by + (bh - fh(F_TINY_B)) / 2 - dp(1);
-        px_frame(kx, ky, kx + kw, ky + fh(F_TINY_B) + dp(2), 1, can_play ? C_FRAME : C_LINE);
-        tx(F_TINY_B, kx + dp(4), ky + dp(1), L"P", -1, can_play ? C_MUTED : C_DIM);
-    }
-    xr -= play_w + dp(10);
-    button(xr - ab, by, xr, by + bh, H_DAY_NEXT, c.next_enabled, L"›", L"Next day (PgDn)", 0);
-    xr -= ab;
-    xl = xr - lab_w;
-    {
-        int nw = tw(F_SMALL_B, nav, -1);
-        if (nw <= lab_w - dp(8)) tx(F_SMALL_B, xl + (lab_w - nw) / 2, G->head_y + (G->head_h - fh(F_SMALL_B)) / 2, nav, -1, C_ICE);
-        else tx_ellipsis(F_SMALL_B, xl + dp(4), G->head_y + (G->head_h - fh(F_SMALL_B)) / 2, lab_w - dp(8), nav, C_ICE);
-    }
-    button(xl - ab, by, xl, by + bh, H_DAY_PREV, c.prev_enabled, L"‹", L"Previous day (PgUp)", 0);
-    /* title, if it fits */
+    button(xr - wn, by, xr, by + bh, H_DAY_NEXT, c.next_enabled, ln, L"Next day (PgDn)");
+    xr -= wn + gap;
+    button(xr - wp, by, xr, by + bh, H_DAY_PREV, c.prev_enabled, lp, L"Previous day (PgUp)");
+    xr -= wp;
     {
         const WCHAR *t = L"The Day's Weather";
-        int room = xl - ab - dp(12) - (G->x + G->pad);
+        int room = xr - dp(12) - (G->x + G->pad);
         if (tw_caps(F_CAPS, t) <= room) tx_caps(F_CAPS, G->x + G->pad, G->head_y + (G->head_h - fh(F_CAPS)) / 2, t, C_SOFT);
     }
 }
@@ -523,8 +489,6 @@ static void tl_live(const TlGeom *G)
         double t = g.a.time < 23.999 ? g.a.time : 23.999, k = t / 24.0;
         int W = G->tx1 - G->tx0, x = G->tx0 + (int)floor(k * W + 0.5);
         int y0 = G->bar_y - dp(4), y1 = G->bar_y + G->bar_h + dp(4), lw = dp(2) < 2 ? 2 : dp(2);
-        char ck[8]; WCHAR wc[8];
-        int tw_, th, bx, by;
         double cy = chart_y_of(G, iwd_day_temp_at(d, g.a.temp_hash, t));
         px_blend(x - lw / 2 - 2, y0, x - lw / 2, y1, 0xFFFFFF, 60);
         px_blend(x - lw / 2 + lw, y0, x - lw / 2 + lw + 2, y1, 0xFFFFFF, 60);
@@ -535,13 +499,18 @@ static void tl_live(const TlGeom *G)
         aa_circle(G->tx0 + k * W, cy, dp(8), 0xBFE6FB, 60);
         aa_circle(G->tx0 + k * W, cy, dp(4) + 0.5, 0xFFFFFF, 255);
         aa_flush();
-        /* time label (top of the bar), flips to the left past 88% */
-        iwd_fmt_clock(g.a.time, ck, sizeof ck); w8(ck, wc, 8);
-        tw_ = tw(F_TINY_B, wc, -1) + dp(12); th = fh(F_TINY_B) + dp(2);
-        by = G->bar_y + dp(6);            /* top of the bar: segment names sit at the bottom */
-        bx = k > 0.88 ? x - dp(8) - tw_ : x + dp(8);
-        px_blend(bx, by, bx + tw_, by + th, 0x020A16, 205);
-        tx(F_TINY_B, bx + dp(6), by + dp(1), wc, -1, C_BRIGHT);
+        /* while scrubbing: the time under the finger (top of the bar), flips left past 88%.
+         * At rest the clock lives in the controls only. */
+        if (g.scrubbing) {
+            WCHAR wc[8];
+            int tw_, th, bx, by;
+            view_clock_text(wc);
+            tw_ = tw(F_TINY_B, wc, -1) + dp(12); th = fh(F_TINY_B) + dp(2);
+            by = G->bar_y + dp(6);        /* top of the bar: segment names sit at the bottom */
+            bx = k > 0.88 ? x - dp(8) - tw_ : x + dp(8);
+            px_blend(bx, by, bx + tw_, by + th, 0x020A16, 205);
+            tx(F_TINY_B, bx + dp(6), by + dp(1), wc, -1, C_BRIGHT);
+        }
     }
     (void)ox; (void)oy;
 }
@@ -615,9 +584,9 @@ static int ledger_layout(int x, int y, int w, bool draw)
     static LgLine e, r;            /* large; not re-entrant (UI thread only) */
     C.x = x + pad; C.w = w - 2 * pad; C.draw = draw; C.y = y;
     if (C.w < dp(120)) C.w = dp(120);
-    /* head: "Dice Ledger" + note */
+    /* head: "Dice Ledger" + note (the day is named by the hero / the header readout) */
     if (draw) {
-        const WCHAR *t = L"Dice Ledger", *nt = L"every roll of the viewed day";
+        const WCHAR *t = L"Dice Ledger", *nt = L"each duration roll also picks the next weather";
         int hy = yy + (dp(28) - fh(F_CAPS)) / 2, tw0 = tw_caps(F_CAPS, t);
         tx_caps(F_CAPS, C.x, hy, t, C_SOFT);
         if (tw0 + dp(16) + tw(F_SMALL_I, nt, -1) <= C.w)
@@ -629,16 +598,7 @@ static int ledger_layout(int x, int y, int w, bool draw)
         yy += fh(F_CAPS) + dp(10);
         return yy - y + dp(6);
     }
-    /* day break */
-    {
-        char date[IWD_DATE_CAP], t[128]; WCHAR wt[128];
-        iwd_format_date(alm_abs_of(&g.a, g.a.view), false, date, sizeof date);
-        snprintf(t, sizeof t, "Day %d \xC2\xB7 %s", (int)d->day, date);
-        w8(t, wt, 128);
-        if (draw) tx_caps(F_CAPS_S, C.x, yy + dp(2), wt, 0xA9CDE6);
-        yy += fh(F_CAPS_S) + dp(6);
-        if (draw) px_fill(C.x, yy - 1, C.x + C.w, yy, C_LINE);
-    }
+    if (draw) px_fill(C.x, yy - 1, C.x + C.w, yy, C_LINE);
     /* carried in */
     if (d->n_segments > 0 && d->segments[0].from_prev_day && d->has_carried_in) {
         const IwdActive *c = &d->carried_in;

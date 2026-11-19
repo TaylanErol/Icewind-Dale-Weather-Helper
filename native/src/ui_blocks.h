@@ -1,7 +1,7 @@
 /* ui_blocks.h - contract between ui_view.c (layout, scrolling, page chrome) and the files
  * that paint the individual page blocks. One file owns each block:
  *   ui_view.c       BLK_HERO, BLK_CONTROLS, BLK_STATS, BLK_EFFECTS, BLK_FOOT
- *   ui_view_time.c  BLK_TIMELINE, BLK_LEDGER
+ *   ui_view_time.c  BLK_TIMELINE, BLK_LEDGER (laid out under BLK_FOOT, only while open)
  *   ui_view_cal.c   BLK_CALENDAR, BLK_DAY
  *
  * blk_measure(which, w): height in px the block needs at width w (px). Must not draw.
@@ -24,5 +24,7 @@ void blk_cal_paint(int which, int x, int y, int w, int h);
 void blk_cal_free(void);
 
 int  view_content_y(int screen_y);                          /* ui_view.c */
+/* The viewed day's clock "HH:MM" from alm_minute_now() (never iwd_fmt_clock). ui_view.c */
+void view_clock_text(WCHAR out[8]);
 
 #endif

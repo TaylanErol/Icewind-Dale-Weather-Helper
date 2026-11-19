@@ -53,7 +53,9 @@
  *  for the same state (numbers formatted as ECMAScript Number.prototype.toString).
  *
  *  Native save file: the same compact v2 object followed by one extra key "native"
- *  (window placement, sound) that the web app ignores. "native" is never exported.
+ *  (window placement, sound, dice ledger open) that the web app ignores. "native" is never
+ *  exported. Native key order: "sound", "maximized", "ledger", then "x" "y" "w" "h" when the
+ *  window rect is known; an old "tab" key is ignored.
  *
  *  v1 migration (web: localStorage "iwd-weather-v1", used only when no v2 save exists):
  *  an object with a non-empty string "seed" becomes
@@ -216,7 +218,8 @@ typedef struct AlmMark {
  * ============================================================================== */
 
 typedef struct AlmUi {
-    bool    chain_note_hidden;   /* hides "Days are chained..." note */
+    bool    chain_note_hidden;   /* web: hides its "Days are chained..." note. The native UI
+                                    has no such note; the flag is kept for the web's sake */
     int32_t cal_year;            /* calendar page shown */
     int     cal_month;           /* 0..11 */
 } AlmUi;
@@ -227,7 +230,7 @@ typedef struct AlmNative {
     bool    has_rect;            /* window rect below is valid */
     int32_t win_x, win_y, win_w, win_h;   /* restored (non-maximised) window rect, px */
     bool    maximized;
-    int     tab;                 /* last secondary tab (UI-defined index) */
+    bool    ledger;              /* the dice ledger under the footer is open */
 } AlmNative;
 
 typedef struct Almanac {
@@ -258,7 +261,6 @@ typedef struct Almanac {
     uint32_t   epoch;            /* bumped whenever the day list is replaced (cache key) */
 
     /* ---- runtime only ---- */
-    bool       playing;
     bool       busy;             /* an advance/transition animation is running */
     uint64_t   rand_state;       /* entropy for randomSeed / event ids (see alm_seed_entropy) */
 } Almanac;
@@ -347,7 +349,7 @@ typedef enum AlmImportStatus {
 } AlmImportStatus;
 
 /* importBackup: on success the whole state is replaced by clean(obj) + applyState, then
- * started = (obj.started is a non-zero number) ? obj.started : now_ms; playing = false.
+ * started = (obj.started is a non-zero number) ? obj.started : now_ms.
  * Native prefs (a->native) are kept. The UI then closes Settings, re-renders, saves and
  * toasts "Backup restored · N day(s), M event(s)" (see alm_fmt_import_toast). */
 AlmImportStatus alm_import_json(Almanac *a, const char *json, size_t len, double now_ms);
@@ -373,8 +375,15 @@ static inline int32_t alm_abs_of(const Almanac *a, int32_t index) { return a->st
 bool alm_today_abs(const Almanac *a, int32_t *abs_out);
 /* Weather day for an abs day, or NULL if none generated there. */
 const IwdDay *alm_weather_of(const Almanac *a, int32_t abs);
-/* hourNow(): clamp(floor(time), 0, 23). */
+/* hourNow(): clamp(floor(time), 0, 23). The rules (weather, temperature, cold table,
+ * light, effects) are per whole hour and always read this. */
 int alm_hour_now(const Almanac *a);
+/* Clock of the viewed day in whole minutes 0..1439, consistent with alm_hour_now():
+ *   h = alm_hour_now(a); m = floor((time - h) * 60 + 1e-6) clamped to 0..59; h * 60 + m.
+ * The UI formats every clock from this ("%02d:%02d"), never from iwd_fmt_clock (which
+ * floors frac * 60 and could print 5/60 as ":04"). A legacy fractional time such as
+ * 13.7283 from a web backup reads as 13:43 (823). */
+int alm_minute_now(const Almanac *a);
 /* True when there is weather on screen (n_days > 0 && view >= 0); otherwise the UI shows
  * the intro ("Before the First Dawn" / "The Dale Awaits"). */
 bool alm_has_view(const Almanac *a);
@@ -401,9 +410,7 @@ enum {
     ALM_FX_DAY_TOAST     = 1 << 4,   /* show the marks of out->toast_abs (alm_day_toast) */
     ALM_FX_TOAST         = 1 << 5,   /* show out->toast (plain text, may contain <b>..</b>) */
     ALM_FX_ANNOUNCE      = 1 << 6,   /* screen-reader summary changed (alm_fmt_announce) */
-    ALM_FX_BECKON        = 1 << 7,   /* highlight the Advance Day button */
-    ALM_FX_STOP_BECKON   = 1 << 8,
-    ALM_FX_REJECTED      = 1 << 9    /* action ignored (busy, out of range) */
+    ALM_FX_REJECTED      = 1 << 7    /* action ignored (busy, out of range) */
 };
 #define ALM_FX_RENDER_ALL (ALM_FX_RENDER_DAY | ALM_FX_RENDER_HOUR | ALM_FX_RENDER_CAL)
 
@@ -423,7 +430,8 @@ typedef struct AlmResult {
  * Otherwise current + 1; if view != current the view first returns to today. Then
  * current = view = target, sel_abs = currentAbs, calendar shows its month, time = land_time.
  * land_time: the web lands at 0 and tweens to IWD_SETTLE_HOUR (12); pass 12 for web parity,
- * or 0 when the advance came from stepping an hour past 23 (native hour stepping, SPEC 6.2).
+ * or the carried-over clock when the advance came from a time step past midnight (native
+ * minute stepping, alm_step_minutes, SPEC 6.2).
  * Rejected when busy or target >= IWD_MAX_DAYS. Day toast lead: first "The expedition
  * begins", else "Today". */
 AlmResult alm_advance(Almanac *a, double land_time);
@@ -435,51 +443,43 @@ AlmResult alm_advance(Almanac *a, double land_time);
  * ANNOUNCE when the view changed. Always SAVE. */
 AlmResult alm_select(Almanac *a, int32_t abs, bool from_calendar);
 
-/* setCurrent(abs) (double click / "Set as current day" / Shift+Enter): today jumps there.
+/* setCurrent(abs) (double click / "Make this day today" in the UI): today jumps there.
  *  i < 0   -> toast "The expedition begins on <b>DATE</b>. Change the start date in
  *             Settings to begin earlier."  (no change)
  *  i >= MAX-> toast "Beyond the almanac: at most 3650 days can be recorded."
  *  i == current -> just select(abs) if not already selected
  *  else roll days, current = view = i, sel_abs = abs, (time = 12 if from intro),
- *       stop beckon, day toast "Today is now" or, with no marks, toast
+ *       day toast "Today is now" or, with no marks, toast
  *       "Today is now <b>DATE</b>". */
 AlmResult alm_set_current(Almanac *a, int32_t abs);
 
 /* stepDay(dir): select(abs_of(view + dir)) when not busy, view >= 0 and in range. */
 AlmResult alm_step_day(Almanac *a, int dir);
 
-/* Set the clock of the viewed day (timeline click/drag, Home/End, playback). Clamped to
- * [0, 23.9999]; stops playback when stop_playing. Rejected without a view. Sets
- * RENDER_HOUR | SAVE; during a drag the UI may defer the save to the mouse release. */
-AlmResult alm_set_time(Almanac *a, double t, bool stop_playing);
+/* Set the clock of the viewed day (timeline scrubbing, undo, the party clock). Clamped to
+ * [0, 23.9999]. Rejected without a view. Sets RENDER_HOUR | SAVE. */
+AlmResult alm_set_time(Almanac *a, double t);
 
-/* Native hour stepping (Right/Space = +1, Left = -1), SPEC 6.2:
- *   within the day: time = hour + dir (whole hours, i.e. HH:00)
- *   +1 at hour 23: view != current -> select(abs_of(view + 1)) and time 0 (rejected at
- *                  MAX_DAYS); view == current -> alm_advance(a, 0) (today moves on)
- *   -1 at hour 0 : view > 0 -> select previous day, time 23; else rejected
- * Stops playback. ANNOUNCE + SAVE. */
-AlmResult alm_step_hour(Almanac *a, int dir);
-
-/* Play/pause the viewed day. Starting at time >= 23.9 restarts from 0. Rejected when busy
- * or without a view. Pausing floors time to the whole hour (deviation: the web keeps the
- * fraction) and sets SAVE. */
-AlmResult alm_toggle_play(Almanac *a);
-/* Playback tick: advance time by dt_hours (web: real seconds / IWD_SECONDS_PER_HOUR).
- * Past 24: if view < limit (limit = view <= current ? current : n_days - 1) the next day
- * opens at time - 24 (sel_abs and calendar follow); else time = 23.99, playing stops, and
- * BECKON if view == current. */
-AlmResult alm_play_tick(Almanac *a, double dt_hours);
+/* Native time stepping (SPEC 6.2). delta in minutes; the UI sends +-5, +-30, +-60.
+ * m = alm_minute_now(a), n = m + delta; time is always stored as minutes / 60.0:
+ *   0 <= n < 1440 : time = n / 60.0
+ *   n >= 1440     : view != current -> select(abs_of(view + 1)), time = (n - 1440) / 60.0
+ *                                       (REJECTED at IWD_MAX_DAYS, nothing changes)
+ *                   view == current -> alm_advance(a, (n - 1440) / 60.0): today moves on
+ *                                       (REJECTED when the almanac is full)
+ *   n < 0         : view > 0 -> select(abs_of(view - 1)), time = (n + 1440) / 60.0
+ *                              (today does NOT move back; the DM now views yesterday)
+ *                   view == 0 -> REJECTED
+ * Rejected when busy, without a view, for delta == 0 or |delta| >= 1440. Sets
+ * ANNOUNCE | SAVE | RENDER_HOUR (plus whatever select / advance set). */
+AlmResult alm_step_minutes(Almanac *a, int delta);
 
 /* setUnit(u). */
 AlmResult alm_set_unit(Almanac *a, bool celsius);
-/* Hide the chained-days note (its X button). */
-AlmResult alm_hide_chain_note(Almanac *a);
 
-/* Calendar paging: step(dir) by months (wraps the year), or showMonthOf(abs). Paging sets
+/* Calendar paging: step(dir) by months (wraps the year). Paging sets
  * SAVE (the web debounces it by ALM_SAVE_SOON_MS). */
 AlmResult alm_cal_step(Almanac *a, int dir);
-void      alm_cal_show_month_of(Almanac *a, int32_t abs);
 /* "Today" button: select(today or start_abs). */
 AlmResult alm_cal_today(Almanac *a);
 
@@ -512,7 +512,8 @@ typedef struct AlmSettingsForm {
     int32_t yn_year;
     bool    yn_year_valid;
     char    yn_name[4 * ALM_YEARNAME_MAX_UNITS + 1];
-    /* temperature + note */
+    /* temperature + note: the native dialog has no controls for these; they stay as
+     * alm_settings_fill set them, so Apply writes them back unchanged */
     bool celsius;
     bool show_chain_note;
     /* advanced */
@@ -699,22 +700,15 @@ typedef struct AlmHero {
 } AlmHero;
 void alm_hero(const Almanac *a, AlmHero *out);
 
-/* Advance button (renderControls):
- *   current < 0      main "Begin the Expedition"  sub "d12 opens <start date>"
- *   current+1 >= MAX main "The Almanac Is Full"    sub "3650 days recorded"
- *   else             main "Advance to <short date of current+1>"
- *                    sub  "<carry event> carries on · <rem> h left" (carry elapsed > 0)
- *                      or "<carry event> rolls in at midnight"
- * During the transition the web shows "Rolling the First Dawn…" / "Night Runs Out…" then
- * "Dawn Breaks…" with sub "continuing the same chain" (native: optional).
- * Day navigator label: view >= 0 ? "<short date> · Day <view+1>" : "No days yet";
- * prev disabled when busy or view <= 0; next disabled when busy, view < 0 or
- * view + 1 >= MAX. */
+/* Advance button (renderControls), one line in the native UI:
+ *   current < 0      "Begin the Expedition"
+ *   current+1 >= MAX "The Almanac Is Full"  (disabled)
+ *   else             "Advance to <short date of current+1>"
+ * Day navigator buttons: prev disabled when busy or view <= 0; next disabled when busy,
+ * view < 0 or view + 1 >= MAX. */
 typedef struct AlmControls {
     char main[96];
-    char sub[128];
     bool advance_enabled;
-    char day_nav[96];
     bool prev_enabled, next_enabled;
 } AlmControls;
 void alm_controls(const Almanac *a, AlmControls *out);

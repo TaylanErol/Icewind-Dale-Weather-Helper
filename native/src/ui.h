@@ -49,7 +49,7 @@
 /* ------------------------------------------------------------------ fonts */
 enum {
     F_BODY, F_BODY_B, F_SMALL, F_SMALL_B, F_SMALL_I, F_TINY, F_TINY_B, F_CAPS, F_CAPS_S,
-    F_NAME, F_DATE, F_FLAVOR, F_TEMP, F_UNIT, F_BTN, F_BTN_BIG, F_H, F_MONTH, F_MONO,
+    F_NAME, F_DATE, F_FLAVOR, F_TEMP, F_UNIT, F_BTN, F_BTN_BIG, F_MONTH, F_MONO,
     F_VALUE, F_NUM, F_TITLE, F_FX, F_FX_B, F_CLOCK,
     F_COUNT
 };
@@ -70,16 +70,16 @@ void surf_free(Surface *s);
 /* ------------------------------------------------------------------ hit regions */
 enum {
     H_NONE = 0,
-    H_SEED, H_UNIT_F, H_UNIT_C, H_SOUND, H_SETTINGS,
-    H_ADVANCE, H_PREV_HOUR, H_NEXT_HOUR, H_CHAIN_X,
-    H_DAY_PREV, H_DAY_NEXT, H_PLAY, H_TIMELINE, H_TIP,
+    H_UNIT_F, H_UNIT_C, H_SOUND, H_SETTINGS,
+    H_ADVANCE, H_STEP,                /* H_STEP arg = minutes: -60 -30 -5 5 30 60 */
+    H_DAY_PREV, H_DAY_NEXT, H_TIMELINE, H_TIP,
     H_CAL_PREV, H_CAL_NEXT, H_CAL_TODAY, H_CAL_CELL, H_UPCOMING,
     H_SET_CURRENT, H_EV_EDIT, H_EV_DEL, H_ADD_EVENT, H_FORM_TYPE, H_FORM_REPEAT,
-    H_FORM_CANCEL, H_FORM_SAVE, H_NOTES, H_FOOT_SETTINGS, H_TOAST, H_SCROLL,
+    H_FORM_CANCEL, H_FORM_SAVE, H_NOTES, H_TOAST, H_SCROLL,
     H_HEAD_NOW, H_BACK_TODAY, H_KEYS, H_KEYS_CARD, H_SAVE_FAIL, H_INTRO_SETTINGS,
+    H_LEDGER,                         /* footer dice chip: dice ledger open / closed */
     /* settings dialog */
-    H_S_MONTH, H_S_RANDOM, H_S_UNIT_F, H_S_UNIT_C, H_S_CHAIN, H_S_ADV, H_S_EXPORT,
-    H_S_IMPORT, H_S_CANCEL, H_S_APPLY, H_S_CLOSE
+    H_S_MONTH, H_S_RANDOM, H_S_EXPORT, H_S_IMPORT, H_S_CANCEL, H_S_APPLY, H_S_CLOSE
 };
 
 typedef struct Hot {
@@ -127,10 +127,6 @@ typedef struct Ui {
     bool      layout_dirty;
     bool      wide;
 
-    /* calendar keyboard focus */
-    bool      grid_focus;
-    int       grid_k;             /* focused cell index into the month cells */
-
     /* toast */
     bool      toast_on;
     char      toast[ALM_TOAST_CAP];
@@ -138,7 +134,6 @@ typedef struct Ui {
     int32_t   toast_abs;
     char      toast_lead[48];
 
-    bool      beckon;
     bool      sound_missing;
 
     /* event form */
@@ -160,9 +155,6 @@ typedef struct Ui {
     /* delete arming */
     char      armed_id[64];
 
-    /* playback */
-    ULONGLONG play_last;
-
     /* sound */
     int       last_wind_event;
 
@@ -170,7 +162,7 @@ typedef struct Ui {
 
     /* in-game helpers (main.c owns the logic, ui_view*.c paints) */
     double    party_time;         /* today's clock while another day is viewed; < 0 none */
-    bool      keys_on;            /* keyboard shortcuts card (F1 / ?) */
+    bool      keys_on;            /* keyboard shortcuts card (F1 or the "?" chip) */
     char      toast_hint[96];     /* second, muted line of the toast ("Ctrl+Z steps back") */
     bool      toast_sticky;       /* no auto-hide (startup problems) */
     bool      save_failed;        /* the last save failed: header shows "Not saved" */
@@ -194,7 +186,6 @@ void  px_vgrad(int x0, int y0, int x1, int y1, DWORD top, DWORD bot);
 void  px_vgrad_a(int x0, int y0, int x1, int y1, DWORD c, int a_top, int a_bot);
 void  px_box(int x0, int y0, int x1, int y1, DWORD fill, DWORD border);   /* 1 px border, soft corners */
 void  px_copy(const DWORD *src, int sw, int sh, int dx, int dy);
-void  px_copy_dim(const DWORD *src, int sw, int sh, int dx, int dy, int keep256);
 
 void  fonts_make(void);
 void  fonts_free(void);
@@ -230,7 +221,6 @@ void aa_moon(double cx, double cy, double r, const IwdMoon *m);
 void aa_circle(double cx, double cy, double r, DWORD fill, int alpha);
 void aa_ring(double cx, double cy, double r, DWORD c, int alpha, double width);
 void aa_flake(double cx, double cy, double r, DWORD c, int alpha);
-void aa_poly(const double *xy, int n, DWORD c, int alpha);
 void aa_line(double x0, double y0, double x1, double y1, DWORD c, int alpha, double width);
 void aa_flush(void);
 void gdip_up(void);
@@ -286,7 +276,7 @@ void ui_relayout(void);             /* re-layout + repaint */
 void ui_save_now(void);             /* durable save now (cancels a pending debounced one) */
 void ui_apply_durable(AlmResult r); /* ui_apply, but ALM_FX_SAVE is written durably at once */
 void ui_toast(const char *text);
-void ui_open_settings(bool focus_seed);
+void ui_open_settings(void);
 void ui_after_settings(bool changed);
 double ui_now_ms(void);
 void ui_style_edit(HWND ed, int fnt);
@@ -307,7 +297,7 @@ void ui_export_backup(HWND owner, WCHAR *msg, int cap);   /* ui_settings.c: Save
 
 /* ------------------------------------------------------------------ ui_settings.c */
 bool settings_register(HINSTANCE inst);
-void settings_open(bool focus_seed);
+void settings_open(void);
 void settings_fonts_changed(void);
 
 #endif /* IWD_UI_H */

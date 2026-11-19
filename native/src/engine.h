@@ -75,7 +75,6 @@ extern "C" {
 #define IWD_EVENT_COUNT      12       /* weather event ids 1..12 */
 #define IWD_MAX_DAYS         3650     /* app.js MAX_DAYS: most weather days an almanac records */
 #define IWD_SETTLE_HOUR      12       /* app.js SETTLE_HOUR: clock of a freshly opened day */
-#define IWD_SECONDS_PER_HOUR 1.25     /* app.js playback speed: real seconds per game hour */
 
 /* 1 Hammer 1489 DR = Harptos.toAbs({year:1489, month:0, day:1}) */
 #define IWD_DEFAULT_START_ABS 543858

@@ -30,8 +30,9 @@ needed). Host tests: `gcc -std=c11 -O2 -ffp-contract=off` on `engine.c store.c` 
 Performance contract (unchanged from the current native app): no timers or animation loops
 while idle; paint only on `WM_PAINT` from a cached back buffer; scaled scene and timeline
 cached; days rebuilt from the seed (3650 days take < 5 ms). Timers exist only while
-something is in motion: playback, a toast on screen, an armed delete button, the optional
-day transition, the notes autosave debounce.
+something is in motion: a toast on screen, an armed delete button, the notes autosave
+debounce, the debounced save, the hero cross-fade, thunder while the sound is on during a
+Lightning Storm. There is no playback (native: removed, see 6.2).
 
 ## 2. Reproducibility
 
@@ -150,7 +151,12 @@ The state struct, clean() rules, JSON schema, key order, v1 migration and import
 specified in `store.h` (header comment). Summary of the state: seed, started, startAbs,
 dayCount, current (party's today, −1 = not begun), currentAbs, view (day on screen),
 selAbs (calendar selection), time (0..24), unit, moonOffset, yearNames, notes, events,
-ui {chainNoteHidden, calYear, calMonth}. Runtime: playing, busy.
+ui {chainNoteHidden, calYear, calMonth}. Runtime: busy. Native-only, saved under "native"
+and never exported: window rect, sound, `ledger` (the dice ledger is open).
+
+**One home per fact** (native): every fact has one place on a screen and every function one
+visible control plus at most one key. Keys are taught in two places only: the control's
+tooltip and the F1 card.
 
 ### 6.1 Actions (web)
 
@@ -158,41 +164,83 @@ ui {chainNoteHidden, calYear, calMonth}. Runtime: playing, busy.
 |---|---|
 | Advance Day / Begin the Expedition | see `alm_advance`. Web animation: old night tweens to 24:00 over clamp((24−t)·0.25, 1.2, 4) s (cosine ease), lands at 00:00 on the new day, then tweens to 12:00 over 2.4 s (first day: lands then 2.6 s). Button shows "Night Runs Out…" / "Dawn Breaks…" (first: "Rolling the First Dawn…"), sub "continuing the same chain". Then day toast "Today · <date>" (first: "The expedition begins · <date>") if the day has marks, save, announce. |
 | Click calendar day | select(abs, fromCalendar) |
-| Double-click calendar day / Shift+Enter / "Set as current day" | setCurrent(abs) |
+| Double-click calendar day / "Set as current day" (native: "Make this day today") | setCurrent(abs) |
 | Prev/next day arrows | stepDay(∓1) |
-| Timeline click/drag | stop playback, time = x/width·24 (clamped < 24), save on release |
-| Timeline keys (focused) | Right/Up +1 h, Left/Down −1 h (clamped 0..23), Home 0, End 23 → time = h + 0.5; Space/Enter = play/pause |
-| Play/Pause | 1.25 s per game hour; plays on through recorded days up to today (or to the last generated day when viewing beyond today), then stops at 23:59 and the Advance button pulses if the viewed day is today |
+| Timeline click/drag | time = x/width·24 (clamped < 24), save on release. Native: snapped to 5 minutes (00:00..23:55), saved debounced |
+| Timeline keys (focused) | web only: Right/Up +1 h, Left/Down −1 h, Home 0, End 23 → time = h + 0.5; Space/Enter = play/pause. Native: the time-step keys of 6.2 |
+| Play/Pause | web only: 1.25 s per game hour, then the Advance button pulses. Native: removed (manual time steps, 6.2) |
 | °F / °C toggle | unit, re-render, save |
 | Sound toggle | on/off; label "Sound on"/"Sound off"; "No audio" if unavailable. Not persisted (native: persisted) |
-| Chain note X | hide note (Settings can bring it back) |
+| Chain note X | web only (native: no chained-days note; Settings' seed help says it once; `chainNoteHidden` is kept untouched for the web) |
 | Calendar ‹ › | page months (wrapping years), debounced save |
 | Calendar "Today" | select(today ?? start); tooltip "Go to the current day" / "Go to the expedition start" |
 | Upcoming item | select(abs) |
-| Seed chip / Settings / "Campaign settings…" | open Settings (seed chip focuses + selects the seed field) |
+| Settings button / F2 (native) | open Settings. Native has no seed chip and no footer link; before the first dawn a link "Change start date or seed…" under Begin the Expedition also opens it |
 
-### 6.2 Native hour/day stepping (in-game requirement)
+### 6.2 Native time and day stepping (in-game requirement)
 
-* **Right arrow, Space, "Next hour" button**: +1 hour on the viewed day (time becomes the
-  whole hour, clock "HH:00"). At 23:00 it crosses midnight: viewing a day other than today
-  -> the next day at 00:00; viewing today -> Advance Day, landing at 00:00 (not 12:00)
-  because the DM is stepping hour by hour. `alm_step_hour`.
-* **Left arrow**: −1 hour; at 00:00 goes to the previous day at 23:00 (if any).
-* **Home / End**: 00:00 / 23:00.
-* **N, Enter (when no text field has focus), "Advance day" button**: Advance Day
-  (lands at 12:00 like the web). No confirmation; the transition is instant or a ≤ 400 ms
-  cosmetic clock sweep that never blocks input (input during it completes it at once).
-* **PageUp / PageDown**: view previous / next day (stepDay). **T**: calendar Today.
-* **P**: play/pause. **U**: toggle °F/°C. **M**: sound on/off. **F2** or **Ctrl+,**:
-  Settings. **Esc**: close dialog/form; when a text field has focus, Esc returns focus to
-  the main view (notes are flushed). Keys are ignored by the main view while a text
-  field (notes, event form) has focus.
-* Hour/day steps stop playback, save immediately, never show a dialog.
+The controls hold one row of six buttons around the clock:
+`[ −1h ][ −30m ][ −5m ]  HH:MM  [ +5m ][ +30m ][ +1h ]` (U+2212; the "m" is dropped when
+the buttons are too narrow). `alm_step_minutes(delta)`, delta in minutes:
+
+| Button | Key | Tooltip |
+|---|---|---|
+| −1h | Left | `Back 1 hour (Left arrow)` |
+| −30m | Shift+Left | `Back 30 minutes (Shift+Left)` |
+| −5m | Ctrl+Left | `Back 5 minutes (Ctrl+Left)` |
+| +5m | Ctrl+Right | `Forward 5 minutes (Ctrl+Right)` |
+| +30m | Shift+Right | `Forward 30 minutes (Shift+Right)` |
+| +1h | Right, Space | `Forward 1 hour (Right arrow or Space)` |
+
+The more modifier, the finer the step (layout independent).
+
+* **Clock**: `time` is always stored as minutes / 60.0 and read back with
+  `alm_minute_now()` (h = hourNow, m = floor((time − h)·60 + 1e−6) clamped 0..59); every
+  clock on screen is "%02d:%02d" of it (never `fmtClock`, which floors and could print 5/60
+  as ":04"). A legacy fractional time (13.7283 from a web backup) reads 13:43 and steps
+  from there. The JSON stays a plain number in [0, 24) that the web accepts.
+* **Within the day** (0 ≤ m + delta < 1440): only the clock moves.
+* **Forward past midnight**: viewing today -> an Advance Day landing at the carried-over
+  minute (23:40 + 30m -> next day 00:10; +1h from 23:00 -> 00:00), with the usual toast
+  "Advanced to <b>DATE</b> · Ctrl+Z steps back"; viewing another day -> the next day at the
+  carried-over minute. Rejected when the almanac is full / at the last possible day. The
+  tooltip then reads `Past midnight: advances the party to <short date> (<key>) · Ctrl+Z
+  steps back` (today; the button gets the Advance button's accent border as a quiet
+  warning) or `Past midnight: on to the next day (<key>)`.
+* **Backward past 00:00**: viewing day > 1 -> the previous day at 23:xx; today does not
+  move back (the DM now views yesterday: amber rule, "Yesterday" tag, "Back to today"
+  pill; the party's clock is kept and restored by T / Esc / the pill). Day 1 -> rejected
+  (the buttons are disabled). Tooltips `Before midnight: shows yesterday, today does not
+  move (<key>)` (today) / `Before midnight: back to the previous day (<key>)`.
+* **Auto-repeat** steps the clock, but a repeated key-down never crosses midnight: holding a
+  key cannot run through days.
+* **Ctrl+Z** undoes the last move of today (advance, midnight step, make-today) and restores
+  that day's exact clock; one level. Within a day the opposite button is the undo.
+* **Rules per whole hour**: weather, temperature (the hour's value, not interpolated), tier
+  / DC, wind, severity, natural light and effects read `hourNow()`. A 5 / 30 minute step
+  inside an hour moves only the clock, the playhead, the chart dot, the forecast countdown
+  and the scene's continuous light overlays; crossing an hour updates the rules, crossing a
+  segment changes the weather with the 240 ms hero cross-fade.
+* **N** or the Advance button: Advance Day (lands at 12:00 like the web). Enter never
+  advances. No confirmation; instant.
+* **PageUp / PageDown** or "‹ Previous day" / "Next day ›": view the previous / next day
+  (stepDay). **T** or **Esc** (when nothing else is open) or the hero's "Back to today"
+  pill: back to today. **E** / **O**: new event / note for the viewed day. **M**: sound
+  on/off. **F2**: Settings. **F1** or the "?" chip: the keys card (13 rows; any key or click
+  closes it). **Up / Down**, **Ctrl+Home / Ctrl+End**: scroll.
+* Removed (native): playback and **P**, **Home / End** (00:00 / 23:00), **Backspace** as
+  undo, the **?** character, **Ctrl+,**, **Ctrl+C** (copy seed), **U** (unit: the header
+  toggle), **Right / Space beginning the expedition**, the calendar keyboard grid (**Tab**,
+  arrows, Enter, Shift+Enter), the right-click day menu.
+* Keys are ignored by the main view while a text field (notes, event form) has focus;
+  Esc there leaves the field (notes flushed, form cancelled).
+* Every step saves through the debounced save (250 ms after the last step of a burst),
+  midnight advances included; close, undo and make-today save durably at once.
 
 ### 6.3 When to save
 
 After every state-changing action (web saves synchronously; calendar paging after 250 ms;
-notes after 600 ms idle or on blur; on pause; on exit (`WM_CLOSE`/`WM_ENDSESSION`); once at
+notes after 600 ms idle or on blur; on exit (`WM_CLOSE`/`WM_ENDSESSION`); once at
 boot after load+clean). Native save file: `%APPDATA%\IcewindDaleAlmanac\state.json`
 (UTF-8, compact JSON + "native" key, atomic replace). A corrupt file is renamed to
 `state.json.bad` before the fresh state is saved. Portable mode: if
@@ -218,60 +266,77 @@ replaces the old one; click dismisses.
 
 ### 7.1 Hero (read-aloud area)
 
-* Date line: moon disc (24 px) + "1 Hammer 1489 DR" + tag pill: "Today" (bright pill),
+* Date line: moon disc + "1 Hammer 1489 DR" + tag pill: "Today" (bright pill),
   "Tomorrow"/"In 3 days" (ahead), "Yesterday"/"3 days ago" (past), "Expedition start"
-  (intro). Abs shown = view day, or start in the intro.
+  (intro). Abs shown = view day, or start in the intro. Viewing another day: an amber 2 px
+  rule along the top, a solid amber tag and, beside it, an outlined amber pill "Back to
+  today" (tooltip "Back to the party's day (T or Esc)"; hover fills it). The top right
+  belongs to the scene: no clock there (native).
+* Meta line: "Day N of the expedition" (intro: "Before the First Dawn") · moon phase name,
+  then the pill "Began this hour" when the event changed at this hour.
+  Native: no clock, no light badge and no aurora badge here (the light lives in the stats,
+  the clock in the controls).
 * Marks of that day as chips (built-in first).
-* Meta line: "Day N of the expedition" (intro: "Before the First Dawn") · moon phase name ·
-  clock "HH:MM" (`fmtClock`, minutes floored) · light badge "Dim light" / "Between light
-  cycles" / "No natural light" (colours: dim #e0f4ff, dark #c7b9ff, none #ffb4c2) ·
-  aurora badge "Auril's Aurora visible" (#7dffcf) when visible.
-* Event name (largest text), flavour (italic, secondary).
-* Temperature: big number `minus(toUnit(tempF))`, unit "°F"/"°C", note "killing cold"
-  (≤ −100°F) / "flesh-freezing" (≤ −80°F) / "air temperature", tier pill
-  "<Tier name> DC <dc>" (DC bold), tooltip "Cold table: DC <tier dc> at <anchor>, <step>".
+* Event name (largest text), flavour (italic, secondary). No tooltip on the name.
+* Temperature: big number `minus(toUnit(tempF))` (the hour's value), unit "°F"/"°C" and the
+  tier pill "<Tier name> DC <dc>" (tier in body text, DC bold), tooltip "Cold table: DC
+  <tier dc> at <anchor>, <step>". This pill is the only cold tier / DC on the page. Native:
+  no "air temperature" / "flesh-freezing" / "killing cold" note.
 * Intro (no days or view < 0): name "The Dale Awaits", flavour "Begin the expedition to
   roll the first dawn. After that, every day grows out of the night before.", no
-  temperature, wind/severity/light "—", forecast "Awaiting the d12", effects note "no
-  weather yet", effects placeholder "Effects of the current weather will appear here, hour
-  by hour.", scene = Clear Skies look with aurora.
+  temperature, scene = Clear Skies look with aurora. Stats, effects and the timeline are
+  not shown at all before the first dawn (native).
 
 ### 7.2 Stats
 
 * Wind: label + 4-pip thin meter, lit pips = level + (level ? 1 : 0) (0, 2, 3, 4).
 * Severity: label + 5-pip meter lit = severity; at 5 (Lethal) lit pips turn #ff9fb2.
-* Natural light: light label + " — Blinded" when level none.
-* Forecast: "<b>Next name</b> at HH:00[ tomorrow] (in N h · Xd4 rolled D)" (parenthesis
-  muted). `iwd_fmt_forecast`.
+* Natural light: the light label only (native; web adds " — Blinded" when level none, which
+  the effects list already states).
+* Forecast (native, built by the UI from `IwdForecast`): "<b>Next name</b> at HH:00[
+  tomorrow]" then, muted, " · in 3 h 25 min" / " · in 4 h" / " · in 25 min" (remaining =
+  change_at·60 − minuteNow). No dice, no parentheses, no tooltip (web: "(in N h · Xd4
+  rolled D)", `iwd_fmt_forecast`, kept in the engine for parity only).
 
 ### 7.3 Effects in play
 
-Header note "<count> in play · <event name>". Items (category label small caps above the
-text) in order: Auril's Aurora effect if visible, or the dark-hour Natural light effect;
-then "Cold table" (chill); then the event's effects. Texts in `engine.h`
-(`iwd_hour_effects`). The chill item is visually emphasised (it changes every hour). The
-whole list must be visible without scrolling at the default size (max 19 items, White
-Out): single-column, compact rows; if space runs out, use two columns before scrolling.
+Title only (native: no "<count> in play · <event name>" note). Items (category label small
+caps above the text) in order: Auril's Aurora effect if visible, or the dark-hour Natural
+light effect; then the event's effects. Texts in `engine.h` (`iwd_hour_effects`). Native:
+the "Cold table" (chill) item is not drawn (the hero's tier pill is the cold table's one
+home; the engine still produces it for parity). The whole list must be visible without
+scrolling at the default size (White Out): single-column, compact rows; if space runs out,
+use two or three sub-columns before scrolling.
 
-### 7.4 Advance control
+### 7.4 Controls (native)
 
-`alm_controls`: main/sub texts (see store.h), chained note "Days are chained: tomorrow
-continues whatever tonight leaves behind. No re-seed." with a close X (tooltip "Hide this
-note (bring it back in Settings)"). Beckon = subtle pulse/highlight (native: a static
-accent border until the next action; no animation timer required).
+A constant 112 px block (it never changes height when the view changes):
+
+* The Advance button, one line, 40 px: "Begin the Expedition" / "Advance to <short date>" /
+  "The Almanac Is Full" (disabled). Tooltips "Roll the first day (N)" / "Advance the party
+  to <short date>, 12:00 (N) · Ctrl+Z steps back" / "3650 days recorded". No sub-line, no
+  key cap, no beckon (web: sub-line "… carries on · N h left" and a pulse after playback).
+* The time-step row (6.2): six 34 px buttons around the clock (30 px light), which is the
+  only clock on the page at rest.
+* Before the first dawn: instead of the row, one link "Change start date or seed…" (opens
+  Settings).
+* No chained-days note (web: "Days are chained…" with an X), no "Viewing …" ribbon (the
+  hero's tag and "Back to today" pill replace it).
 
 ### 7.5 Timeline "The Day's Weather"
 
-* Day navigator "<short date> · Day N" / "No days yet", ‹ › buttons, play/pause button
-  (tooltip "Play the day" / "Pause").
+* Head: title left; right two buttons "‹ Previous day" / "Next day ›" (glyphs only below a
+  520 px block width), tooltips "Previous day (PgUp)" / "Next day (PgDn)". No date between
+  them and no play button (native; web: "<short date> · Day N" navigator and play/pause).
 * Segment bar 0-24 h: one block per segment in the event colour (vertical gradient from
   colour+white 8% to colour darkened toward #0b2440 30% is fine, or flat), 1px dark
   separators, label = event name when the block is ≥ 64 px wide; dark ink #04182b on light
   colours, light ink #e9f6ff on ids 3 and 4. Hatched 8 px edge (`cont-l`/`cont-r`) when the
-  segment continues from the previous / into the next day. Tooltip:
-  "<name> · HH:00–HH:00 · Xd4 [r1+r2] = D h[ · continues from the previous day][ ·
-  continues into the next day]" (end 24 shows "24:00").
-* Playhead: 2 px white line + time label "HH:MM", label flips to the left past 88%.
+  segment continues from the previous / into the next day. Tooltip (native, no dice):
+  "<name> · HH:00–HH:00 (D h)[ · continues from the previous day][ · continues into the
+  next day]" (end 24 shows "24:00").
+* Playhead: 2 px white line + knob; the time label "HH:MM" (from minuteNow) is drawn only
+  while scrubbing, flipping to the left past 88%.
 * Ticks every 3 h: "00 03 06 … 21 24".
 * Cycle bands (three thin tracks labelled Moon, Twilight, Aurora): the window
   (rgba(200,235,255,.1)) and, on top, the lit part: Moon/Twilight where the hour's event
@@ -285,11 +350,19 @@ accent border until the next action; no animation timer required).
   showing fmtTemp of the hour at the segment middle, placed 6 px above the highest of
   three samples; a dot at the current time. Native: GDI+ antialiased 1.5-2 px line, cached
   bitmap per (day, unit, width).
-* Empty: "No days recorded yet — begin the expedition."
+* Not shown before the first dawn (native; web empty text "No days recorded yet — begin the
+  expedition.").
 
 ### 7.6 Dice ledger (viewed day only)
 
-* Header "Day N · <date>".
+Native: collapsed by default. A small dice chip (26 px square, outlined die face with three
+pips, no text, no key) at the left of the footer row opens it; tooltips "Show the dice
+ledger (the rolls behind this day)" / "Hide the dice ledger". The open state is persisted
+as `native.ledger`. The panel sits 8 px under the footer row (the chip stays where it was),
+at most 620 px wide, and the page scrolls to show it.
+
+* Header "Dice Ledger" + note "each duration roll also picks the next weather" (native: no
+  "Day N · <date>" line; the hero or the header readout names the day).
 * If the day starts mid-event: time "00:00", "<event> continues", "carried over from Day
   N−1 · R of D h remain → <next>" (R = duration − elapsed of carriedIn).
 * Each log entry: time HH:00; genesis "[d12 die value] d12 opens with <event>",
@@ -298,10 +371,9 @@ accent border until the next action; no animation timer required).
   Dice drawn as small numbered marks (plain boxed digits; no cartoon die art).
 * Empty: "No rolls yet".
 
-## 8. Secondary panes: calendar, day, notes, ledger
+## 8. Secondary panes: calendar, day, notes
 
-Secondary content lives below or beside the live weather (tabs "Calendar", "Day & notes",
-"Ledger" are fine) and never covers it.
+Secondary content lives below or beside the live weather and never covers it.
 
 ### 8.1 Calendar of Harptos
 
@@ -313,66 +385,79 @@ Secondary content lives below or beside the live weather (tabs "Calendar", "Day 
   exists: dominant event (colour swatch/line in its colour, not an icon) + min temp
   fmtTemp; up to 2 event chips (type colour left rule + title) and "+N". States: today
   (strong bright border + "Today" tag), selected (bright border), before start (40%
-  opacity), new moon (lighter top glow), start (aurora-green left edge + "Start" tag),
-  has event (2 px underline in the first user event's type colour).
-* Click selects, double-click (or Shift+Enter) sets today. Keyboard in the grid:
-  arrows move (±1, ±10, down from the third row goes to festivals), Home/End.
-* Legend: Natural, Unnatural, Auril, Reminder chips, "New moon · sacrifice to Auril",
-  hint "Click a day to view it · double-click to make it today".
+  opacity), new moon (lighter top glow), start (aurora-green left edge + "Start" tag).
+  Native: no extra underline in the first event's colour (the chip rule carries it).
+* Click selects, double-click sets today (Ctrl+Z steps back). Native: no keyboard grid
+  mode, no right-click menu, no legend or hint row (colours are learnt in the event form;
+  cell tooltips name everything). The "Today" button has no key cap (tooltip "Go to the
+  current day (T)").
 
 ### 8.2 Upcoming
 
 "Upcoming" + note ("next ten days from today" / "from the expedition start"); items with
-rel ("Today", "Tomorrow", "In 3 days") + short date + chips; empty "Nothing marked for the
-next ten days.". Click selects.
+rel ("Tomorrow", "In 3 days") + short date + chips; empty "Nothing marked for the next ten
+days.". Click selects. Native: today's own row is skipped (today's marks are on the hero
+and in the day panel).
 
 ### 8.3 Day panel (selected day)
 
-`alm_day_panel` gives eyebrow, date, sub, moon line, weather summary (dominant name, event
-sequence, colour strip, temperature range, cold DC range) or the "no weather" text, and the
-"Set as current day" button state. Then:
+Native, slim: the panel repeats nothing the hero, timeline or calendar show (no eyebrow,
+date, sub, moon line or weather box; `alm_day_panel` still provides them). In order:
 
-* "Events & reminders": marks list; user events show title, meta (`alm_fmt_mark_meta`),
-  details, Edit and Delete (tooltip "Delete" or "Delete (all occurrences)" for repeats).
-  Delete is two-step: first press arms (red, tooltip "Press again to delete"), auto-disarms
-  after 3 s. Empty: "No events or reminders on this day.". Button "Add event / reminder".
-* Event form (inline, not modal): title "New event or reminder" / "Edit event"; Title
-  (max 120, placeholder "e.g. Auril's followers attack Bryn Shander", required: empty
-  title marks the field invalid and refocuses); Type radio Natural/Unnatural/Auril/Reminder
-  (default Natural); Repeat select (labels above, default Never); Details (optional,
-  multiline, max 2000); buttons "Cancel" and "Add to the almanac" / "Save changes". Esc
-  cancels. New events anchor on selAbs; edits keep their anchor and id. Selecting another
-  day closes an unsaved *new* event form.
-* Notes: label "Notes" + state "editing…" / "saved"; multiline, placeholder "What happened
-  on this day? Rumours, debts, oaths, frostbite…"; autosave 600 ms after typing stops and
-  on blur / day change / settings / advance; blank text deletes the note.
+1. Only when the selected day is not the day on screen (before the start, beyond the
+   almanac): its date in bold, then the store's `weather_none` text, muted.
+2. "Make this day today" (ghost button), only when the selected day is in range and not
+   today (and not the start day before the first dawn); tooltip "Make this the party's
+   current day (or double-click the day in the calendar)".
+3. "Events & reminders" with a ghost "Add" at the right end of its label row (hidden while
+   the form is open; tooltip "New event or reminder on this day (E)"): marks list; user
+   events show title, meta (`alm_fmt_mark_meta`), details, Edit and Delete (tooltip
+   "Delete" or "Delete (all occurrences)" for repeats). Delete is two-step: first press arms
+   (red, tooltip "Press again to delete"), auto-disarms after 3 s. Empty: "None on this
+   day.". The event form opens in place, under the list:
+
+   Event form (inline, not modal): title "New event or reminder" / "Edit event"; Title
+   (max 120, placeholder "e.g. Auril's followers attack Bryn Shander", required: empty
+   title marks the field invalid and refocuses); Type radio Natural/Unnatural/Auril/Reminder
+   (native default: the last type used, first Reminder); Repeat select (labels above,
+   default Never); Details (optional, multiline, max 2000); buttons "Cancel" and "Add to the
+   almanac" / "Save changes". Esc cancels. New events anchor on selAbs; edits keep their
+   anchor and id. Selecting another day closes an unsaved *new* event form.
+4. Notes: label "Notes" + state "editing…" / "saved"; multiline, placeholder "What happened
+   on this day? Rumours, debts, oaths, frostbite…"; autosave 600 ms after typing stops and
+   on blur / day change / settings / advance; blank text deletes the note.
 
 ## 9. Settings dialog (modal; the only modal besides file pickers)
 
-Title "Settings". Groups (exact labels):
+Title "Settings". Groups (exact labels; native: two columns when wide, Campaign start, Expedition
+seed, Year names | Moon, Backup):
 
-1. "Campaign start" - help "The first day of the expedition: weather day 1 and the
-   starting point of the seeded chain." Fields Day (1-30; disabled for festivals), "Month
-   or festival" (18 options, `alm_start_option`), "Year (DR)". Error line (red #ffb4c2).
-2. "Expedition seed" - help "One seed drives the whole campaign. Each new day continues
-   the same chain, and the weather carries over from the previous night." Field Seed
-   (monospace, max 40) + "Random" button (fills a random seed, disarms).
+1. "Campaign start" - help "Weather day 1." Fields Day (1-30; disabled for festivals),
+   "Month or festival" (18 options, `alm_start_option`), "Year (DR)". Error line (red
+   #ffb4c2).
+2. "Expedition seed" - help "One seed rolls the whole campaign; each day continues from the
+   night before." Field Seed (monospace, max 40; copy with the field's own Ctrl+C) +
+   "Random" button (fills a random seed, disarms). This is the only place the seed shows.
 3. "Year names" - "Year (DR)" (initially the calendar's year; changing it reloads the
    name) + "Name (optional)" (max 80, placeholder "e.g. Year of the Warrior Princess").
-4. "Temperature" °F/°C and switch "Show the chained-days note".
-5. "Advanced" (collapsed) - "Selûne offset (days)" (−30..30 step 0.5) + help "Shifts the
-   moon's phases. Positive values make them arrive later. Canon: full at the first
-   midnight of 1 Hammer 1372 DR, 30 days 10½ hours per cycle."
-6. "Backup" - "Export backup", "Import backup", message line (default "Everything in one
+4. "Moon" (native: a plain group; web: the collapsed "Advanced") - "Selûne offset (days)"
+   (−30..30 step 0.5) + help "Shifts the moon's phases. Positive values make them arrive
+   later. Canon: full at the first midnight of 1 Hammer 1372 DR, 30 days 10½ hours per
+   cycle."
+5. "Backup" - "Export backup", "Import backup", message line (default "Everything in one
    JSON file: seed, dates, notes, events and settings."; after export "Backup saved as
    <file>"; import errors "That file is not an almanac backup." / "Could not read that
    file.").
+
+Native: no "Display" group (web: °F/°C and "Show the chained-days note"): the header toggle
+is the unit's one home and there is no chained-days note. Apply writes the unit and the
+note flag back unchanged.
 
 Buttons "Cancel" / "Apply". Apply validates the date (`alm_settings_apply`); when the start
 date or seed changes and weather exists, the first Apply shows the red confirmation box and
 turns the button into "Regenerate weather" (warning style); editing the date/seed fields or
 pressing Random disarms it; the second Apply regenerates. Seed is trimmed + upper-cased;
-empty = random. Apply also stores unit, chain-note visibility, moon offset (invalid -> 0,
+empty = random. Apply also stores the moon offset (invalid -> 0,
 clamped) and the year name (empty deletes). Esc/Cancel/close discard. Export writes the
 backup via a Save As dialog (default name `icewind-almanac-<SEED>-<YYYYMMDD>.json`); import
 uses an Open dialog (`*.json`) and replaces the whole state immediately (no confirmation in
@@ -380,24 +465,29 @@ the web; native: same, it is user-initiated through a file dialog).
 
 ## 10. Native layout (in-game use)
 
-Default client size 1280×860 logical px (raised from 760 so a 19-effect White Out fits
-without scrolling) (scaled by DPI, clamped to the monitor work area;
-remember the last window rect in "native"). Minimum 960×640. Without scrolling, at the
+Default client size 1280×860 logical px (scaled by DPI, clamped to the monitor work area;
+remember the last window rect in "native"). Minimum 640×560. Without scrolling, at the
 default size, the DM must see: the scene, event name, temperature + tier/DC, wind,
-natural light, severity, forecast and the current hour's effects.
+natural light, severity, forecast, the current hour's effects and the day's timeline, and
+each of clock, date, weather name, temperature, tier/DC, light and forecast exactly once.
 
-Suggested arrangement (top to bottom):
+Arrangement (native, at 1280×860 everything below up to the calendar head is above the
+fold):
 
-1. Thin title bar row: app name (small caps, restrained), seed (click -> Settings), °F/°C,
-   Sound, Settings. ~36 px.
-2. Live band (~60% of height): left ~60%: the scene image (cover-fit, 3:1 source) with
-   the hero text drawn over a dark gradient at its bottom-left (date line, event name
-   ~34-40 px, flavour, big temperature ~72 px with unit, tier pill). Right ~40%: Advance
-   button ("Advance to 2 Hammer" + sub), "Next hour" button, then Wind / Severity /
-   Natural light / Forecast rows with thin meters, then the effects list.
-3. Timeline strip (~150 px): day navigator, play, cycle bands, temperature trace, bar.
-4. Secondary area (rest, may scroll internally): tabs Calendar | Day & notes | Ledger
-   (+ Upcoming within Calendar).
+1. Header row (42 px): app name (small caps, restrained) + subtitle, or the live readout
+   "<date> · HH:MM · <event> · <temp> · <tier> DC n" (just "DC n" when tight; amber tag
+   while another day is viewed) once the hero is scrolled away; at the right "?", °F/°C,
+   Sound, Settings. No seed chip.
+2. Wide (≥ 940 px): left ~56%: the hero (scene with the date line, event name, flavour,
+   temperature and tier pill), the timeline, then the calendar (grid + Upcoming). Right
+   ~44%: controls (Advance + time steps, constant 112 px), stats (Wind / Severity /
+   Natural light / Forecast), effects, then the selected day's events, reminders and notes
+   directly under the effects.
+3. Narrow (< 940 px): hero, controls, stats, effects, timeline, calendar, day.
+4. Footer row (34 px): the dice chip left, "Rules: Icewind Dale — Weather Events and
+   Effects" right (tiny, dim); the dice ledger opens under it.
+5. Before the first dawn: hero ("The Dale Awaits") and calendar left; Begin the
+   Expedition + the settings link, then the start day's events and notes, right.
 
 Visual language: dark slate background (#0b111b family as in the current native app),
 restrained typography (Segoe UI / Segoe UI Semibold, a serif such as Georgia or
@@ -457,17 +547,19 @@ Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see 
 
 ## 12. Ambiguities resolved / native deviations
 
-1. **Hour stepping** (not in the web, required at the table): Right/Space step whole
-   hours (time = h, clock HH:00) instead of the web's h + 0.5; crossing 23→00 on today
-   advances the day and lands at 00:00; other days just move on (6.2). Advance Day itself
-   lands at 12:00 as in the web.
+1. **Time stepping** (not in the web, required at the table): six buttons and keys step
+   ±5 / ±30 / ±60 minutes (time = minutes / 60, read back with `alm_minute_now`); crossing
+   midnight forward on today advances the day and lands at the carried-over minute; other
+   days just move on; backward past 00:00 views the previous day (6.2). Advance Day itself
+   lands at 12:00 as in the web. The rules stay per whole hour.
 2. **Transitions** are instant (or a short non-blocking sweep) instead of the web's
    2.6-6.4 s tween, so "busy" is normally never true; the API keeps it for an optional
    animation.
-3. **Playback** may step once per game hour (1.25 s) instead of continuously; the
-   playhead jumps hourly. The stop time is 23.99 as in the web.
+3. **Playback** is removed (web: Play/Pause at 1.25 s per game hour); the DM steps time by
+   hand (6.2). The Advance button therefore never "beckons".
 4. **Save file** instead of localStorage; v1 detection by content (`v` absent or 1),
-   extra "native" key (ignored by the web, never exported); sound preference persisted.
+   extra "native" key (ignored by the web, never exported); sound preference and the dice
+   ledger's open state persisted.
 5. **Seed upper-casing** uses 1:1 case mapping (no 'ß' -> "SS"); seeds imported from a
    backup are kept verbatim, so parity holds for imported campaigns.
 6. **Date range**: abs/year limited to years −99999..99999; out-of-range stored values
@@ -477,8 +569,8 @@ Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see 
 9. **Notes**: native caps a single note at 256 KiB (web unlimited); events capped at
    20000.
 10. **Multi-tab merge** (web `storage` event) is not applicable.
-11. **Screen-reader announcement** (`announce`) may be exposed via the window's accessible
-    name or simply used as the tooltip of the hero; optional.
+11. **Screen-reader announcement** (`announce`) is kept in the store but not shown (native:
+    no live window title and no tooltip on the event name; the window title is constant).
 12. Scene moon in the image is the PDF moon fraction (½/¾/Full), matching the light label;
     the calendar/hero discs show the real Selûne phase - as in the web.
 13. Dominant-event ties go to the lowest id (JS key order + stable sort).

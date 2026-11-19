@@ -1,28 +1,34 @@
 /* ui_view.c - page composition of the main window: layout of the blocks (wide two-column
  * and narrow one-column), vertical scrolling, the sticky header, the live-weather blocks
- * HERO / CONTROLS / STATS / EFFECTS / FOOT, the toast and the slim scrollbar.
- * TIMELINE + LEDGER are painted by ui_view_time.c, CALENDAR + DAY by ui_view_cal.c
- * (see ui_blocks.h).
+ * HERO / CONTROLS / STATS / EFFECTS / FOOT, the toast, the keys card and the slim
+ * scrollbar. TIMELINE + LEDGER are painted by ui_view_time.c, CALENDAR + DAY by
+ * ui_view_cal.c (see ui_blocks.h).
  *
  * Coordinates: the back buffer is the client area. The header (view_header_h() px) is
  * sticky at the top; below it the content scrolls. Content coordinates are unscrolled with
  * y = 0 at the top of the scrolling area:  screen_y = content_y - g.scroll + header_h.
  *
+ * One home per fact (SPEC 7): the date, "Day N", the Today tag, the weather name, the
+ * temperature and the cold tier + DC live in the hero; the clock lives in the time-step row
+ * of the controls; wind, severity, natural light and the forecast in the stats; the rules
+ * of the hour in the effects; the dice only in the ledger.
+ *
  * Layout (in-game use, SPEC 10). Wide (client width >= 940 logical px):
  *     left  ~56%:  HERO, TIMELINE, CALENDAR
- *     right ~44%:  CONTROLS, STATS, EFFECTS, LEDGER, DAY
- *     FOOT across the bottom.
+ *     right ~44%:  CONTROLS, STATS, EFFECTS, DAY
+ *     FOOT across the bottom, then the LEDGER (only while open, under the footer).
  *   At the default size (1280x860) the scene, event name, temperature + tier/DC, the
- *   advance/hour controls, wind, severity, natural light, forecast, the timeline and the
- *   whole effects list are above the fold: the hero is shortened so hero + timeline fit the
- *   viewport, and the effects list chooses 1..3 sub-columns so that it ends inside the
- *   viewport (White Out, 19 items, needs two). The calendar starts below the timeline
- *   (its head is visible). The effects block is the last live block of its column, so its
- *   changing height moves only the ledger and the day panel below it (never the calendar).
- *   The day panel's EDIT controls are re-placed after every paint (edits_sync), so they
- *   follow it. Calendar (left) and the selected day (right) sit side by side when scrolled.
- *   Narrow (below 940 px, e.g. a window snapped to half a laptop screen): HERO,
- *   CONTROLS, STATS, EFFECTS, TIMELINE, CALENDAR, DAY, LEDGER, FOOT.
+ *   advance / time-step controls, wind, severity, natural light, forecast, the timeline and
+ *   the whole effects list are above the fold: the hero is shortened so hero + timeline fit
+ *   the viewport, and the effects list chooses 1..3 sub-columns so that it ends inside the
+ *   viewport (White Out needs two). The controls block has a constant height, so stats and
+ *   effects never move when the viewed day changes. The calendar starts below the timeline
+ *   (its head is visible). The day panel's EDIT controls are re-placed after every paint
+ *   (edits_sync), so they follow it. Calendar (left) and the selected day (right) sit side
+ *   by side when scrolled.
+ *   Narrow (below 940 px, e.g. a window snapped to half a laptop screen): HERO, CONTROLS,
+ *   STATS, EFFECTS, TIMELINE, CALENDAR, DAY, FOOT, LEDGER.
+ *   Before the first dawn STATS, EFFECTS and TIMELINE are not laid out at all.
  *
  * view_paint() re-runs the layout every time (cheap: a few text measurements), so block
  * heights that change with the hour or the day never overlap even when the caller only
@@ -30,21 +36,19 @@
  *
  * HIT REGIONS registered here (id: arg):
  *   H_NONE      : 0   opaque cover behind the header and the toast (blocks the page below)
- *   H_SEED      : 0   seed chip (web: opens Settings with the seed field focused)
  *   H_UNIT_F    : 0   / H_UNIT_C : 0   temperature unit segments
  *   H_SOUND     : 0   sound toggle chip
  *   H_SETTINGS  : 0   header Settings chip
- *   H_ADVANCE   : 0   Advance Day / Begin the Expedition (enabled = alm_controls().advance_enabled)
- *   H_PREV_HOUR : 0   / H_NEXT_HOUR : 0   whole-hour stepping (alm_step_hour(-1 / +1))
- *   H_CHAIN_X   : 0   hide the chained-days note
- *   H_TIP       : 0   tooltip-only regions (tier pill, mark chips, event name, badges)
- *   H_FOOT_SETTINGS : 0   "Campaign settings…" link
- *   H_HEAD_NOW  : 0   header live readout shown while the hero is scrolled away (to top)
- *   H_BACK_TODAY: 0   "Viewing tomorrow · Back to today" ribbon in the controls
- *   H_INTRO_SETTINGS : 0  "Change start date or seed…" link before the first dawn
  *   H_KEYS      : 0   "?" chip in the header (keyboard shortcuts card)
- *   H_KEYS_CARD : 0   the open shortcuts card (click closes)
  *   H_SAVE_FAIL : 0   "Not saved" header chip (Save dialog for a backup)
+ *   H_HEAD_NOW  : 0   header live readout shown while the hero is scrolled away (to top)
+ *   H_BACK_TODAY: 0   "Back to today" pill beside the hero's tag while another day is viewed
+ *   H_ADVANCE   : 0   Advance Day / Begin the Expedition (enabled = alm_controls().advance_enabled)
+ *   H_STEP      : d   time step of d minutes (-60 -30 -5 5 30 60) -> alm_step_minutes(d)
+ *   H_INTRO_SETTINGS : 0  "Change start date or seed..." link before the first dawn
+ *   H_TIP       : 0   tooltip-only regions (tier pill, mark chips)
+ *   H_LEDGER    : 0   footer dice chip: open / close the dice ledger
+ *   H_KEYS_CARD : 0   the open shortcuts card (click closes)
  *   H_TOAST     : 0   the toast box (click dismisses)
  *   H_SCROLL    : 0 thumb (start a drag; g.sb_grab = mouse_y - thumb top, see
  *                 view_scroll_for_thumb), -1 track above the thumb (page up),
@@ -58,10 +62,6 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <wctype.h>
-
-/* Public helper beyond ui.h (CONTRACT GAP, see report): scroll offset for a thumb drag,
- * from the mouse y in client coordinates and g.sb_grab (offset of the grab inside the
- * thumb). main.c may call it from WM_MOUSEMOVE while g.sb_drag. */
 
 /* ================================================================== state */
 
@@ -253,30 +253,21 @@ static int markup(const char *u8, int x, int y, int w, int f, int fb, DWORD c, D
     return rich(sp, nsp, x, y, w, fh(fb) > fh(f) ? fh(fb) : fh(f), draw);
 }
 
-/* button with optional key hint at the right */
-static void button(int x0, int y0, int x1, int y1, int id, bool en, const WCHAR *label, int f,
-                   const WCHAR *hint, const WCHAR *tip)
+/* plain button (header Settings) */
+static void button(int x0, int y0, int x1, int y1, int id, bool en, const WCHAR *label, int f, const WCHAR *tip)
 {
     bool hot = en && is_hot(id), press = en && is_pressed(id);
     DWORD fill = !en ? mix(C_PANEL, C_PANEL2, 120) : press ? C_FIELD : hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2;
     DWORD border = !en ? C_LINE : hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME;
-    DWORD ink = en ? C_BRIGHT : C_DIM;
-    int hw = hint ? tw(F_TINY_B, hint, -1) + dp(8) : 0;
-    int avail = x1 - x0 - dp(12) - (hw ? hw + dp(4) : 0);
-    int lw = tw(f, label, -1);
-    int lx = (x0 + x1 - (hw ? hw + dp(6) : 0) - (lw < avail ? lw : avail)) / 2;
+    int avail = x1 - x0 - dp(12), lw = tw(f, label, -1);
+    int lx = (x0 + x1 - (lw < avail ? lw : avail)) / 2;
     px_box(x0, y0, x1, y1, fill, border);
     if (lx < x0 + dp(6)) lx = x0 + dp(6);
-    tx_ellipsis(f, lx, (y0 + y1 - fh(f)) / 2, avail, label, ink);
-    if (hw && x1 - x0 > hw + dp(40)) {
-        int hx = x1 - dp(6) - hw, hy = (y0 + y1 - fh(F_TINY_B)) / 2 - dp(1);
-        px_frame(hx, hy, hx + hw, hy + fh(F_TINY_B) + dp(2), 1, en ? C_FRAME : C_LINE);
-        tx(F_TINY_B, hx + dp(4), hy + dp(1), hint, -1, en ? C_MUTED : C_DIM);
-    }
+    tx_ellipsis(f, lx, (y0 + y1 - fh(f)) / 2, avail, label, en ? C_BRIGHT : C_DIM);
     hot_add(x0, y0, x1, y1, id, 0, en, tip);
 }
 
-/* small outlined key cap ("T", "PgDn"); returns its width */
+/* small outlined key cap of the keys card ("T", "PgDn"); returns its width */
 static int keycap(int x, int y, const WCHAR *k, DWORD border, DWORD ink, bool draw)
 {
     int w = tw(F_TINY_B, k, -1) + dp(8);
@@ -330,7 +321,7 @@ static DWORD light_rgb(IwdLightLevel lv)
 static DWORD cat_rgb(IwdCat c)
 {
     switch (c) {
-    case IWD_CAT_COLD: case IWD_CAT_CHILL:      return 0x9FE3FF;
+    case IWD_CAT_COLD:                          return 0x9FE3FF;
     case IWD_CAT_HAZARD: case IWD_CAT_TRAVEL:   return 0xFFB4C2;
     case IWD_CAT_FLAME:                         return 0xFFC999;
     case IWD_CAT_CONCENTRATION:                 return 0xD5C4FF;
@@ -374,18 +365,20 @@ typedef struct HeroGeo {
 } HeroGeo;
 
 static const char *k_intro_name = "The Dale Awaits";
-static const char *k_intro_flavor = "Begin the expedition to roll the first dawn. After that, every day grows out of the night before. Press N to begin.";
+static const char *k_intro_flavor = "Begin the expedition to roll the first dawn. After that, every day grows out of the night before.";
 
-static void temp_texts(const Live *L, WCHAR *num, WCHAR *unit, WCHAR *note, WCHAR *tier_name, WCHAR *tier_dc)
+static void temp_texts(const Live *L, WCHAR *num, WCHAR *unit, WCHAR *tier_name, WCHAR *tier_dc)
 {
     char b[64];
     iwd_fmt_minus(g.a.celsius ? iwd_f_to_c(L->temp_f) : L->temp_f, b, sizeof b);
     to_w(b, num, 32);
     lstrcpyW(unit, g.a.celsius ? L"\x00B0" L"C" : L"\x00B0" L"F");
-    to_w(iwd_temp_note(L->temp_f), note, 48);
     to_w(L->cold.tier ? L->cold.tier->name : "", tier_name, 48);
     wsprintfW(tier_dc, L" DC %d", L->cold.dc);
 }
+
+/* the tier + DC pill under the temperature: the only home of the cold table on the page */
+static int tier_pill_w(const WCHAR *tn, const WCHAR *td) { return tw(F_BODY, tn, -1) + tw(F_BODY_B, td, -1) + dp(14); }
 
 static int marks_of_hero(int32_t abs, AlmMark *marks, int cap)
 {
@@ -402,18 +395,15 @@ static void hero_geo(const Live *L, int w, int nmarks, HeroGeo *G)
     G->top_h = fh(F_DATE) + dp(6) + pill_h(F_SMALL_B);
     if (nmarks > 0) G->top_h += dp(8) + chip_h();
     if (!L->intro) {
-        WCHAR num[32], unit[8], note[48], tn[48], td[24];
-        int asc, dh, side_h;
-        temp_texts(L, num, unit, note, tn, td);
+        WCHAR num[32], unit[8], tn[48], td[24];
+        int asc, dh, side_h, pw;
+        temp_texts(L, num, unit, tn, td);
         temp_metrics(&asc, &dh);
         G->num_w = tw(F_TEMP, num, -1);
         G->side_w = tw(F_UNIT, unit, -1);
-        if (tw(F_SMALL, note, -1) > G->side_w) G->side_w = tw(F_SMALL, note, -1);
-        {
-            int pw = tw(F_SMALL, tn, -1) + tw(F_SMALL_B, td, -1) + dp(12);
-            if (pw > G->side_w) G->side_w = pw;
-        }
-        side_h = fh(F_UNIT) + fh(F_SMALL) + dp(4) + pill_h(F_SMALL_B);
+        pw = tier_pill_w(tn, td);
+        if (pw > G->side_w) G->side_w = pw;
+        side_h = fh(F_UNIT) + dp(4) + pill_h(F_BODY_B);
         G->temp_w = G->num_w + dp(10) + G->side_w;
         G->temp_h = side_h > dh ? side_h : dh;
     }
@@ -498,8 +488,7 @@ static void hero_fade(int x, int y, int w, int h, int id)
     int yy;
     bool full = y >= view_header_h() && y + h <= g_tgt->h && x >= 0 && x + w <= g_tgt->w;
     if (!full) { s_prev_id = -1; return; }
-    if (g.fade_req && id != s_prev_id && s_prev_id >= 0 && s_prev && s_pw == w && s_ph == h &&
-        !g.a.playing && !g.scrubbing) {
+    if (g.fade_req && id != s_prev_id && s_prev_id >= 0 && s_prev && s_pw == w && s_ph == h && !g.scrubbing) {
         g.fade_k = 8;
         ui_fade_start();
     }
@@ -532,11 +521,30 @@ static void htx(int f, int x, int y, const WCHAR *t, DWORD c)
     else tx_sh(f, x, y, t, -1, c);
 }
 
+#define C_AMBER 0xFFC999               /* "not the party's day" */
+
+/* "Back to today": an outlined amber pill beside the hero's tag (another day on screen) */
+static void back_pill(int x, int y, int w, bool hot)
+{
+    const WCHAR *s = L"Back to today";
+    int h = pill_h(F_SMALL_B);
+    if (s_lg) {
+        px_blend(x, y, x + w, y + h, 0xFFFFFF, hot ? 210 : 140);
+        px_frame(x, y, x + w, y + h, 1, mix(INK_LG, C_AMBER, 110));
+        tx(F_SMALL_B, x + dp(6), y + dp(2), s, -1, INK_LG);
+        return;
+    }
+    px_blend(x, y, x + w, y + h, C_SHADOW, 165);
+    if (hot) px_blend(x, y, x + w, y + h, C_AMBER, 60);
+    px_frame(x, y, x + w, y + h, 1, hot ? C_AMBER : mix(C_SHADOW, C_AMBER, 190));
+    tx(F_SMALL_B, x + dp(6), y + dp(2), s, -1, hot ? C_BRIGHT : C_AMBER);
+}
+
 static void hero_paint(int x, int y, int w, int h)
 {
     Live L; HeroGeo G; AlmHero hr; AlmMark mk[8]; SceneLook lk;
     const DWORD *sc;
-    int nm, ip, tx0, ty, cx, bottom, clk_x;
+    int nm, ip, tx0, ty, cx, bottom, right;
     WCHAR wb[128];
     DWORD c_bright, c_ice, c_soft, c_flav;
     bool other_day;
@@ -559,25 +567,13 @@ static void hero_paint(int x, int y, int w, int h)
     else px_fill(x, y, x + w, y + h, C_PANEL2);
     px_frame(x, y, x + w, y + h, 1, C_LINE);
     other_day = hr.tag_kind == ALM_TAG_AHEAD || hr.tag_kind == ALM_TAG_PAST;
-    if (other_day) px_fill(x, y, x + w, y + dp(2), 0xFFC999);   /* not the party's day */
+    if (other_day) px_fill(x, y, x + w, y + dp(2), C_AMBER);   /* not the party's day */
 
     tx0 = x + ip;
     ty = y + ip;
+    right = x + w - ip;              /* nothing at the top right: that is the scene's */
 
-    /* the clock, large, at the top right: the value that changes most often */
-    clk_x = x + w - ip;
-    if (!L.intro) {
-        char clk[16];
-        iwd_fmt_clock(g.a.time, clk, sizeof clk);
-        to_w(clk, wb, 128);
-        clk_x = x + w - ip - tw(F_CLOCK, wb, -1);
-        htx(F_CLOCK, clk_x, ty - dp(6), wb, L.intro ? c_soft : c_bright);
-        hot_add(clk_x, ty - dp(4), x + w - ip, ty + fh(F_CLOCK) - dp(8), H_TIP, 0, true,
-                L"Time of day (\x2190 / \x2192 step an hour, Home / End 00:00 / 23:00)");
-        clk_x -= dp(14);
-    }
-
-    /* line 1: moon disc + date + tag */
+    /* line 1: moon disc + date + tag (+ the way back to today) */
     {
         double r = dp(10);
         int dy = ty + (fh(F_DATE) - (int)(2 * r)) / 2;
@@ -588,43 +584,36 @@ static void hero_paint(int x, int y, int w, int h)
         htx(F_DATE, cx, ty, wb, c_bright);
         cx += tw(F_DATE, wb, -1) + dp(10);
         if (hr.tag_kind != ALM_TAG_NONE && hr.tag[0]) {
-            DWORD col = hr.tag_kind == ALM_TAG_TODAY ? C_ICE : hr.tag_kind == ALM_TAG_START ? C_AURORA : 0xFFC999;
+            DWORD col = hr.tag_kind == ALM_TAG_TODAY ? C_ICE : hr.tag_kind == ALM_TAG_START ? C_AURORA : C_AMBER;
             int py = ty + (fh(F_DATE) - pill_h(F_SMALL_B)) / 2;
+            int pw = pill(F_SMALL_B, 0, 0, wz(hr.tag), 0, false, false);
             bool solid = hr.tag_kind == ALM_TAG_TODAY || other_day;
-            if (cx + pill(F_SMALL_B, 0, 0, wz(hr.tag), 0, false, false) <= clk_x)
+            if (cx + pw <= right) {
                 pill(F_SMALL_B, cx, py, wz(hr.tag), col, solid, true);
+                cx += pw + dp(6);
+            }
+            if (other_day) {
+                int bw = pill(F_SMALL_B, 0, 0, L"Back to today", 0, false, false);
+                if (cx + bw <= right) {
+                    back_pill(cx, py, bw, is_hot(H_BACK_TODAY));
+                    hot_add(cx, py, cx + bw, py + pill_h(F_SMALL_B), H_BACK_TODAY, 0, true,
+                            L"Back to the party's day (T or Esc)");
+                }
+            }
         }
         ty += fh(F_DATE) + dp(6);
     }
 
-    /* line 2: day label · moon phase · light badge · aurora badge · "began this hour" */
+    /* line 2: day label · moon phase · "began this hour" */
     {
         const WCHAR *sep = L"  \x00B7  ";
-        int my = ty + (pill_h(F_SMALL_B) - fh(F_SMALL)) / 2, right = x + w - ip;   /* below the clock's digits */
+        int my = ty + (pill_h(F_SMALL_B) - fh(F_SMALL)) / 2;
         cx = tx0;
         to_w(hr.day_label, wb, 128);
         htx(F_SMALL_B, cx, my, wb, c_ice); cx += tw(F_SMALL_B, wb, -1);
         htx(F_SMALL, cx, my, sep, c_soft); cx += tw(F_SMALL, sep, -1);
         to_w(hr.moon.name ? hr.moon.name : "", wb, 128);
         htx(F_SMALL, cx, my, wb, c_ice); cx += tw(F_SMALL, wb, -1) + dp(12);
-        if (!L.intro) {
-            const WCHAR *b = wz(iwd_light_badge(L.light.level));
-            int bw = pill(F_SMALL_B, 0, 0, b, 0, false, false);
-            if (cx + bw <= right) {
-                pill(F_SMALL_B, cx, ty, b, light_rgb(L.light.level), false, true);
-                {
-                    char lab[IWD_LIGHT_LABEL_CAP];
-                    iwd_light_label(L.ev, &L.light, lab, sizeof lab);
-                    hot_add(cx, ty, cx + bw, ty + pill_h(F_SMALL_B), H_TIP, 0, true, wz(lab));
-                }
-                cx += bw + dp(6);
-            }
-        }
-        if (L.intro || L.light.aurora_visible) {
-            const WCHAR *b = L"Auril's Aurora visible";
-            int bw = pill(F_SMALL_B, 0, 0, b, 0, false, false);
-            if (cx + bw <= right) { pill(F_SMALL_B, cx, ty, b, C_AURORA, false, true); cx += bw + dp(6); }
-        }
         if (!L.intro) {
             int pe = prev_hour_event(&L);
             if (pe > 0 && pe != L.ev->id) {
@@ -638,7 +627,7 @@ static void hero_paint(int x, int y, int w, int h)
 
     /* line 3: marks of the day */
     if (nm > 0) {
-        int i, right = x + w - ip;
+        int i;
         ty += dp(8);
         cx = tx0;
         for (i = 0; i < nm; i++) {
@@ -655,7 +644,7 @@ static void hero_paint(int x, int y, int w, int h)
         }
     }
 
-    /* bottom band: event name + flavour (left), temperature (right) */
+    /* bottom band: event name + flavour (left), temperature + tier/DC (right) */
     bottom = y + h - ip;
     {
         const char *nmtxt = L.intro ? k_intro_name : L.ev->name;
@@ -664,45 +653,37 @@ static void hero_paint(int x, int y, int w, int h)
         Span sp;
         sp.s = wz(nmtxt); sp.n = -1; sp.font = F_NAME; sp.flags = s_lg ? 0 : SP_SHADOW; sp.color = c_bright;
         rich(&sp, 1, tx0, ny, G.name_w, fh(F_NAME), true);
-        if (!L.intro) {
-            char ann[256];
-            if (alm_fmt_announce(&g.a, ann, sizeof ann) > 0)
-                hot_add(tx0, ny, tx0 + G.name_w, fy, H_TIP, 0, true, wz(ann));
-        }
         sp.s = wz(fl); sp.font = F_FLAVOR; sp.color = c_flav;
         rich(&sp, 1, tx0, fy, G.name_w, fh(F_FLAVOR), true);
 
         if (!L.intro) {
-            WCHAR num[32], unit[8], note[48], tn[48], td[24];
-            int asc, dh, tx_r, tb, nx, sx, sy;
-            temp_texts(&L, num, unit, note, tn, td);
+            WCHAR num[32], unit[8], tn[48], td[24];
+            int asc, dh, tx_r, tb, nx, sx, sy, ph = pill_h(F_BODY_B);
+            temp_texts(&L, num, unit, tn, td);
             temp_metrics(&asc, &dh);
             if (G.stacked) { tx_r = tx0 + G.temp_w; tb = ny - dp(10); }
             else           { tx_r = x + w - ip;     tb = bottom; }
             nx = tx_r - G.temp_w;
             /* number: baseline on the band's bottom */
             htx(F_TEMP, nx, tb - asc, num, c_bright);
-            /* side column: unit, note, tier pill (bottom aligned) */
+            /* side column: unit at the top of the digits, tier pill on the baseline */
             sx = nx + G.num_w + dp(10);
-            sy = tb - (fh(F_UNIT) + fh(F_SMALL) + dp(4) + pill_h(F_SMALL_B));
+            sy = tb - (fh(F_UNIT) + dp(4) + ph);
             if (sy > tb - dh - dp(4)) sy = tb - dh - dp(4);
             htx(F_UNIT, sx, sy, unit, c_ice);
-            sy += fh(F_UNIT);
-            htx(F_SMALL, sx, sy, note, c_soft);
-            sy = tb - pill_h(F_SMALL_B);
+            sy = tb - ph;
             {
                 DWORD col = tier_rgb(L.cold.tier_index);
-                int pw = tw(F_SMALL, tn, -1) + tw(F_SMALL_B, td, -1) + dp(12), ph = pill_h(F_SMALL_B);
+                int pw = tier_pill_w(tn, td);
                 char tip[IWD_TIER_TIP_CAP];
                 if (s_lg) {                    /* inverted: solid ink on the white */
                     px_fill(sx, sy, sx + pw, sy + ph, INK_LG);
-                    tx(F_SMALL, sx + dp(6), sy + (ph - fh(F_SMALL)) / 2, tn, -1, col);
                 } else {
                     px_blend(sx, sy, sx + pw, sy + ph, C_SHADOW, 185);
                     px_frame(sx, sy, sx + pw, sy + ph, 1, mix(C_SHADOW, col, 170));
-                    tx(F_SMALL, sx + dp(6), sy + (ph - fh(F_SMALL)) / 2, tn, -1, col);
                 }
-                tx(F_SMALL_B, sx + dp(6) + tw(F_SMALL, tn, -1), sy + (ph - fh(F_SMALL_B)) / 2, td, -1, C_BRIGHT);
+                tx(F_BODY, sx + dp(7), sy + (ph - fh(F_BODY)) / 2, tn, -1, col);
+                tx(F_BODY_B, sx + dp(7) + tw(F_BODY, tn, -1), sy + (ph - fh(F_BODY_B)) / 2, td, -1, C_BRIGHT);
                 iwd_fmt_tier_tip(&L.cold, g.a.celsius, tip, sizeof tip);
                 hot_add(sx, sy, sx + pw, sy + ph, H_TIP, 0, true, wz(tip));
             }
@@ -714,175 +695,144 @@ static void hero_paint(int x, int y, int w, int h)
 
 /* ================================================================== CONTROLS */
 
+/* Constant height (SPEC 7.4): [Advance] over the time-step row
+ *     [ -1h ][ -30m ][ -5m ]   HH:MM   [ +5m ][ +30m ][ +1h ]
+ * The clock in the middle is the only clock on the page at rest. */
 #define CT_PAD dp(12)
 
-static int chain_note_w(int w) { return w - 2 * CT_PAD - dp(30); }
-static const WCHAR *k_chain = L"Each day continues from the last: weather still running at midnight carries over.";
+static int adv_h(void) { return dp(40); }
+static int step_row_h(void) { return dp(40); }
 
-static int adv_h(void) { return fh(F_BTN_BIG) + fh(F_SMALL) + dp(16); }
-static int hour_row_h(void) { return fh(F_BTN) + dp(14); }
-static int ribbon_h(void) { return dp(28); }
-
-static bool viewing_other_day(void)
+void view_clock_text(WCHAR out[8])
 {
-    return alm_has_view(&g.a) && g.a.current >= 0 && g.a.view != g.a.current;
-}
-
-/* the Advance button's second line, phrased as what happens at midnight */
-static void adv_sub(const AlmControls *c, char *out, size_t cap)
-{
-    char d[IWD_DATE_CAP];
-    if (g.a.current < 0) {
-        iwd_format_date(g.a.start_abs, false, d, sizeof d);
-        snprintf(out, cap, "Rolls the first day \xC2\xB7 %s", d);
-        return;
-    }
-    if (g.a.current + 1 < IWD_MAX_DAYS && g.a.current < g.a.n_days) {
-        const IwdActive *ca = &g.a.days[g.a.current].carry_out;
-        const IwdEventDef *ev = iwd_event(ca->id);
-        if (ev && ca->elapsed > 0)
-            snprintf(out, cap, "At midnight: %s continues, %d h left", ev->name, (int)ca->duration - (int)ca->elapsed);
-        else if (ev)
-            snprintf(out, cap, "At midnight: %s rolls in", ev->name);
-        else
-            lstrcpynA(out, c->sub, (int)cap);
-        return;
-    }
-    lstrcpynA(out, c->sub, (int)cap);
+    int m = alm_minute_now(&g.a);
+    wsprintfW(out, L"%02d:%02d", m / 60, m % 60);
 }
 
 static int controls_measure(int w)
 {
-    int h = CT_PAD + adv_h() + dp(8);
-    if (g.a.current < 0) return h + fh(F_SMALL) + dp(6) + fh(F_SMALL) + CT_PAD;
-    h += hour_row_h();
-    if (viewing_other_day()) h += dp(8) + ribbon_h();
-    else if (!g.a.ui.chain_note_hidden) h += dp(8) + wrap(F_SMALL, 0, 0, chain_note_w(w), k_chain, C_MUTED, false);
-    return h + CT_PAD;
+    (void)w;
+    if (g.a.current < 0) return CT_PAD + adv_h() + dp(8) + fh(F_SMALL) + CT_PAD;
+    return CT_PAD + adv_h() + dp(8) + step_row_h() + CT_PAD;
+}
+
+static const WCHAR *step_key(int d)
+{
+    switch (d) {
+    case -60: return L"Left arrow";
+    case -30: return L"Shift+Left";
+    case -5:  return L"Ctrl+Left";
+    case 5:   return L"Ctrl+Right";
+    case 30:  return L"Shift+Right";
+    default:  return L"Right arrow or Space";
+    }
+}
+
+static void step_btn(int x0, int y0, int x1, int y1, int d, bool en, bool warn, const WCHAR *label, const WCHAR *tip)
+{
+    bool hot = en && g.hot_id == H_STEP && g.hot_arg == d;
+    bool press = hot && g.press_id == H_STEP && g.press_arg == d;
+    DWORD fill = !en ? mix(C_PANEL, C_PANEL2, 120) : press ? C_FIELD : hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2;
+    DWORD border = !en ? C_LINE : hot ? mix(C_FRAME, C_ACCENT, 140) : warn ? mix(C_FRAME, C_ACCENT, 90) : C_FRAME;
+    px_box(x0, y0, x1, y1, fill, border);
+    tx_center(F_BTN, (x0 + x1) / 2, (y0 + y1 - fh(F_BTN)) / 2, label, en ? C_BRIGHT : C_DIM);
+    hot_add(x0, y0, x1, y1, H_STEP, d, en, tip);
 }
 
 static void controls_paint(int x, int y, int w, int h)
 {
     AlmControls c;
     int ip = CT_PAD, x0 = x + ip, x1 = x + w - ip, yy = y + ip;
-    char sub[160];
     panel_bg(x, y, w, h);
     alm_controls(&g.a, &c);
-    adv_sub(&c, sub, sizeof sub);
 
-    /* Advance Day */
+    /* Advance Day: one line */
     {
         int y1 = yy + adv_h();
         bool en = c.advance_enabled, hot = en && is_hot(H_ADVANCE), press = en && is_pressed(H_ADVANCE);
         DWORD fill = !en ? mix(C_PANEL, C_PANEL2, 120) : press ? C_FIELD
                    : hot ? mix(C_PANEL2, C_ACCENT, 46) : mix(C_PANEL2, C_ACCENT, 14);
-        DWORD border = !en ? C_LINE : (g.beckon || hot) ? C_ACCENT : mix(C_FRAME, C_ACCENT, 90);
-        const WCHAR *hint = L"N";
-        int hw = tw(F_TINY_B, hint, -1) + dp(10), tx_w = x1 - x0 - dp(28) - hw;
+        DWORD border = !en ? C_LINE : hot ? C_ACCENT : mix(C_FRAME, C_ACCENT, 90);
+        const WCHAR *lab = wz(c.main);
+        int lw = tw(F_BTN_BIG, lab, -1), room = x1 - x0 - dp(24);
+        WCHAR tip[200];
         px_box(x0, yy, x1, y1, fill, border);
-        if (g.beckon && en) px_frame(x0 + 1, yy + 1, x1 - 1, y1 - 1, 1, mix(fill, C_ACCENT, 150));
-        tx_ellipsis(F_BTN_BIG, x0 + dp(14), yy + dp(8), tx_w, wz(c.main), en ? C_BRIGHT : C_DIM);
-        tx_ellipsis(F_SMALL, x0 + dp(14), yy + dp(8) + fh(F_BTN_BIG) + dp(1), tx_w, wz(sub), en ? C_SOFT : C_DIM);
-        {
-            int hx = x1 - dp(12) - hw, hy = (yy + y1 - fh(F_TINY_B)) / 2 - dp(2);
-            px_frame(hx, hy, hx + hw, hy + fh(F_TINY_B) + dp(4), 1, en ? mix(C_FRAME, C_ACCENT, 80) : C_LINE);
-            tx(F_TINY_B, hx + dp(5), hy + dp(2), hint, -1, en ? C_SOFT : C_DIM);
+        tx_ellipsis(F_BTN_BIG, lw < room ? (x0 + x1 - lw) / 2 : x0 + dp(12), (yy + y1 - fh(F_BTN_BIG)) / 2,
+                    room, lab, en ? C_BRIGHT : C_DIM);
+        if (g.a.current < 0) lstrcpyW(tip, L"Roll the first day (N)");
+        else if (g.a.current + 1 >= IWD_MAX_DAYS) wsprintfW(tip, L"%d days recorded", IWD_MAX_DAYS);
+        else {
+            char d[IWD_DATE_CAP]; WCHAR wd[IWD_DATE_CAP];
+            iwd_format_date(alm_abs_of(&g.a, g.a.current + 1), true, d, sizeof d);
+            to_w(d, wd, IWD_DATE_CAP);
+            wsprintfW(tip, L"Advance the party to %s, 12:00 (N) \x00B7 Ctrl+Z steps back", wd);
         }
-        hot_add(x0, yy, x1, y1, H_ADVANCE, 0, en,
-                g.a.current < 0 ? L"Roll the first dawn (N, Space or \x2192)"
-                                : L"Advance the party to the next day (N) \x00B7 Ctrl+Z steps back");
+        hot_add(x0, yy, x1, y1, H_ADVANCE, 0, en, tip);
         yy = y1 + dp(8);
     }
 
-    /* before the first dawn: what will start, and where to change it */
+    /* before the first dawn: where to change what will be rolled */
     if (g.a.current < 0) {
-        char d[IWD_DATE_CAP], t[200];
-        const WCHAR *lk = L"Change start date or seed\x2026 (F2)";
+        const WCHAR *lk = L"Change start date or seed\x2026";
         bool hot = is_hot(H_INTRO_SETTINGS);
-        int lw = tw(F_SMALL, lk, -1), ly = yy + fh(F_SMALL) + dp(6);
-        iwd_format_date(g.a.start_abs, false, d, sizeof d);
-        snprintf(t, sizeof t, "Starts %s \xC2\xB7 seed %.60s", d, g.a.seed ? g.a.seed : "");
-        tx_ellipsis(F_SMALL, x0, yy, x1 - x0, wz(t), C_SOFT);
-        tx(F_SMALL, x0, ly, lk, -1, hot ? C_BRIGHT : C_ACCENT);
-        px_fill(x0, ly + fh(F_SMALL) - dp(1), x0 + lw, ly + fh(F_SMALL), hot ? C_BRIGHT : mix(C_PANEL, C_ACCENT, 110));
-        hot_add(x0 - dp(2), ly - dp(2), x0 + lw + dp(2), ly + fh(F_SMALL) + dp(2), H_INTRO_SETTINGS, 0, true,
+        int lw = tw(F_SMALL, lk, -1);
+        tx(F_SMALL, x0, yy, lk, -1, hot ? C_BRIGHT : C_ACCENT);
+        px_fill(x0, yy + fh(F_SMALL) - dp(1), x0 + lw, yy + fh(F_SMALL), hot ? C_BRIGHT : mix(C_PANEL, C_ACCENT, 110));
+        hot_add(x0 - dp(2), yy - dp(2), x0 + lw + dp(2), yy + fh(F_SMALL) + dp(2), H_INTRO_SETTINGS, 0, true,
                 L"Choose these before the first dawn: changing them later rolls all weather again");
         return;
     }
 
-    /* hour stepping: [Previous hour] HH:MM [Next hour] */
+    /* time steps around the clock */
     {
+        static const int deltas[6] = { -60, -30, -5, 5, 30, 60 };
         bool view = alm_has_view(&g.a) && !g.a.busy;
-        int hr = alm_hour_now(&g.a), y1 = yy + hour_row_h();
-        bool prev_en = view && !(g.a.view <= 0 && hr == 0);
-        bool next_en = view;
-        const WCHAR *ntip = L"Next hour (Right arrow or Space)";
-        char clk[16];
-        int cw, bw;
-        WCHAR wc[16];
-        if (view && hr == 23) {
-            if (g.a.view == g.a.current) {
-                next_en = c.advance_enabled;
-                ntip = L"Next hour: midnight advances the party to the next day (Right arrow or Space)";
+        bool today = view && g.a.view == g.a.current;
+        int m = alm_minute_now(&g.a), gap = dp(4), bh = dp(34), i;
+        int b0 = yy + (step_row_h() - bh) / 2, b1 = b0 + bh;
+        int clock_w = tw(F_CLOCK, L"00:00", -1) + dp(28);
+        int bw = (x1 - x0 - clock_w - 4 * gap) / 6;
+        bool short_m = bw < tw(F_BTN, L"\x2212" L"30m", -1) + dp(8);
+        WCHAR clk[8];
+        for (i = 0; i < 6; i++) {
+            int d = deltas[i], n = m + d, a = d < 0 ? -d : d;
+            int bx0 = i < 3 ? x0 + i * (bw + gap) : x1 - (6 - i) * bw - (5 - i) * gap;
+            bool en = view, warn = false;
+            const WCHAR *key = step_key(d);
+            const WCHAR *amount = a == 60 ? L"1 hour" : a == 30 ? L"30 minutes" : L"5 minutes";
+            WCHAR lab[12], tip[200];
+            if (a == 60) wsprintfW(lab, L"%c1h", d < 0 ? 0x2212 : L'+');
+            else wsprintfW(lab, short_m ? L"%c%d" : L"%c%dm", d < 0 ? 0x2212 : L'+', a);
+            if (d < 0) {
+                if (n < 0) {
+                    if (g.a.view <= 0) en = false;
+                    wsprintfW(tip, today ? L"Before midnight: shows yesterday, today does not move (%s)"
+                                         : L"Before midnight: back to the previous day (%s)", key);
+                } else {
+                    wsprintfW(tip, L"Back %s (%s)", amount, key);
+                }
+            } else if (n >= 1440) {
+                if (today) {
+                    char dd[IWD_DATE_CAP]; WCHAR wd[IWD_DATE_CAP];
+                    en = view && c.advance_enabled;
+                    warn = en;
+                    iwd_format_date(alm_abs_of(&g.a, g.a.current + 1), true, dd, sizeof dd);
+                    to_w(dd, wd, IWD_DATE_CAP);
+                    wsprintfW(tip, L"Past midnight: advances the party to %s (%s) \x00B7 Ctrl+Z steps back", wd, key);
+                } else {
+                    en = view && g.a.view + 1 < IWD_MAX_DAYS;
+                    wsprintfW(tip, L"Past midnight: on to the next day (%s)", key);
+                }
             } else {
-                next_en = g.a.view + 1 < IWD_MAX_DAYS;
-                ntip = L"Next hour: midnight, the next day (Right arrow or Space)";
+                wsprintfW(tip, L"Forward %s (%s)", amount, key);
             }
+            step_btn(bx0, b0, bx0 + bw, b1, d, en, warn, lab, tip);
         }
-        iwd_fmt_clock(g.a.time, clk, sizeof clk);
-        to_w(clk, wc, 16);
-        cw = tw(F_VALUE, L"00:00", -1) + dp(20);
-        bw = (x1 - x0 - cw) / 2;
-        button(x0, yy, x0 + bw, y1, H_PREV_HOUR, prev_en,
-               bw > tw(F_BTN, L"Previous hour", -1) + dp(46) ? L"Previous hour" : L"Prev", F_BTN,
-               L"\x2190", L"Previous hour (Left arrow)");
-        tx_center(F_VALUE, x0 + bw + cw / 2, (yy + y1 - fh(F_VALUE)) / 2, wc, view ? C_BRIGHT : C_DIM);
-        button(x1 - bw, yy, x1, y1, H_NEXT_HOUR, next_en,
-               bw > tw(F_BTN, L"Next hour", -1) + dp(46) ? L"Next hour" : L"Next", F_BTN,
-               L"\x2192", ntip);
-        yy = y1;
-    }
-
-    /* another day on screen: say so, and offer the way back */
-    if (viewing_other_day()) {
-        AlmHero hr; char t[160], d[IWD_DATE_CAP];
-        int rh = ribbon_h(), ry0, ry1, kx, bw;
-        bool hot = is_hot(H_BACK_TODAY);
-        const WCHAR *back = L"Back to today";
-        DWORD amber = 0xFFC999;
-        yy += dp(8);
-        ry0 = yy; ry1 = yy + rh;
-        alm_hero(&g.a, &hr);
-        if (hr.tag[0] >= 'A' && hr.tag[0] <= 'Z') hr.tag[0] = (char)(hr.tag[0] + 32);
-        iwd_format_date(hr.abs, true, d, sizeof d);
-        snprintf(t, sizeof t, "Viewing %s \xC2\xB7 %s", hr.tag[0] ? hr.tag : "another day", d);
-        px_fill(x0, ry0, x1, ry1, mix(C_PANEL2, amber, hot ? 60 : 40));
-        px_fill(x0, ry0, x0 + dp(2), ry1, amber);
-        kx = x1 - dp(8) - keycap(0, 0, L"T", 0, 0, false);
-        keycap(kx, (ry0 + ry1 - fh(F_TINY_B)) / 2 - dp(1), L"T", mix(C_PANEL2, amber, 160), C_BRIGHT, true);
-        bw = tw(F_SMALL_B, back, -1);
-        tx(F_SMALL_B, kx - dp(8) - bw, (ry0 + ry1 - fh(F_SMALL_B)) / 2, back, -1, hot ? C_BRIGHT : amber);
-        tx_ellipsis(F_SMALL_B, x0 + dp(10), (ry0 + ry1 - fh(F_SMALL_B)) / 2, kx - dp(20) - bw - (x0 + dp(10)), wz(t), C_BRIGHT);
-        hot_add(x0, ry0, x1, ry1, H_BACK_TODAY, 0, true, L"Back to the party's day (T or Esc)");
-        return;
-    }
-
-    /* chained-days note */
-    if (!g.a.ui.chain_note_hidden) {
-        int nw = chain_note_w(w), nh;
-        yy += dp(8);
-        nh = wrap(F_SMALL, x0, yy, nw, k_chain, C_MUTED, true);
+        view_clock_text(clk);
         {
-            int bx = x1 - dp(22), by = yy - dp(2), s = dp(22);
-            bool hot = is_hot(H_CHAIN_X);
-            double m = dp(7);
-            if (hot) px_box(bx, by, bx + s, by + s, mix(C_PANEL, C_PANEL2, 200), C_FRAME);
-            aa_line(bx + m, by + m, bx + s - m, by + s - m, hot ? C_BRIGHT : C_MUTED, 255, 1.4);
-            aa_line(bx + s - m, by + m, bx + m, by + s - m, hot ? C_BRIGHT : C_MUTED, 255, 1.4);
-            aa_flush();
-            hot_add(bx, by, bx + s, by + s, H_CHAIN_X, 0, true, L"Hide this note (bring it back in Settings)");
+            int cl = x0 + 3 * bw + 2 * gap, cr = x1 - 3 * bw - 2 * gap;
+            tx_center(F_CLOCK, (cl + cr) / 2, yy + (step_row_h() - fh(F_CLOCK)) / 2, clk, view ? C_BRIGHT : C_DIM);
         }
-        (void)nh;
     }
 }
 
@@ -904,20 +854,16 @@ typedef struct StatTexts {
     int wind_lit, sev_lit;
     bool lethal;
     DWORD light_col;
-    WCHAR fc_name[64], fc_mid[64], fc_paren[80], fc_full[IWD_FORECAST_CAP];
-    bool fc_plain;
+    WCHAR fc_name[64], fc_mid[48], fc_left[48];
 } StatTexts;
 
+/* Forecast (SPEC 7.2): "<Next name>" bold, " at HH:00[ tomorrow]", " · in 3 h 25 min"
+ * muted. The countdown runs from the clock in minutes; the dice belong to the ledger. */
 static void stat_texts(const Live *L, StatTexts *T)
 {
     memset(T, 0, sizeof *T);
-    if (L->intro) {
-        lstrcpyW(T->wind, L"\x2014"); lstrcpyW(T->sev, L"\x2014"); lstrcpyW(T->light, L"\x2014");
-        lstrcpyW(T->fc_name, L"Not rolled yet");
-        T->fc_plain = true;
-        T->light_col = C_SOFT;
-        return;
-    }
+    T->light_col = C_SOFT;
+    if (L->intro || !L->day) return;          /* the block is not laid out before the first dawn */
     {
         const IwdWind *wd = iwd_wind(L->ev->wind);
         int sv = iwd_severity(L->ev->id);
@@ -927,41 +873,39 @@ static void stat_texts(const Live *L, StatTexts *T)
         to_w(iwd_severity_label(sv), T->sev, 32);
         T->sev_lit = sv;
         T->lethal = sv >= 5;
-        iwd_fmt_light_value(L->ev, &L->light, b, sizeof b);
+        /* the state only: "Blinded" is the effects list's rule (no repeat) */
+        iwd_light_label(L->ev, &L->light, b, sizeof b);
         to_w(b, T->light, IWD_LIGHT_LABEL_CAP + 24);
         T->light_col = light_rgb(L->light.level);
     }
     {
         IwdForecast f = iwd_forecast(L->day, L->hour);
-        char b[IWD_FORECAST_CAP], *paren;
-        size_t nl = 0;
-        iwd_fmt_forecast(&f, b, sizeof b, &nl);
-        to_w(b, T->fc_full, IWD_FORECAST_CAP);
-        if (nl >= sizeof b) nl = 0;
-        paren = strstr(b + nl, " (");
-        if (paren) {
-            /* the dice bookkeeping belongs to the ledger (and the tooltip) */
-            char *dot = strstr(paren, " Â· ");
-            if (dot) { dot[0] = ')'; dot[1] = 0; }
-            to_w(paren, T->fc_paren, 80);
-            *paren = 0;
-        }
-        to_w(b + nl, T->fc_mid, 64);
-        b[nl] = 0;
-        to_w(b, T->fc_name, 64);
+        const IwdEventDef *nx = iwd_event(f.next_id);
+        char hh[8]; WCHAR wh[8];
+        int rem = f.change_at * 60 - alm_minute_now(&g.a), hr, mn;
+        if (!nx) return;
+        if (rem < 1) rem = 1;
+        hr = rem / 60; mn = rem % 60;
+        to_w(nx->name, T->fc_name, 64);
+        iwd_fmt_hour(f.change_at, hh, sizeof hh);
+        to_w(hh, wh, 8);
+        wsprintfW(T->fc_mid, L" at %s%s", wh, f.tomorrow ? L" tomorrow" : L"");
+        if (hr && mn) wsprintfW(T->fc_left, L" \x00B7 in %d h %d min", hr, mn);
+        else if (hr)  wsprintfW(T->fc_left, L" \x00B7 in %d h", hr);
+        else          wsprintfW(T->fc_left, L" \x00B7 in %d min", mn);
     }
 }
 
 static int fc_spans(const StatTexts *T, Span *sp)
 {
     int n = 0;
-    if (T->fc_plain) {
-        sp[0].s = T->fc_name; sp[0].n = -1; sp[0].font = F_BODY; sp[0].flags = 0; sp[0].color = C_SOFT;
+    if (!T->fc_name[0]) {
+        sp[0].s = L"\x2014"; sp[0].n = -1; sp[0].font = F_BODY; sp[0].flags = 0; sp[0].color = C_SOFT;
         return 1;
     }
     sp[n].s = T->fc_name; sp[n].n = -1; sp[n].font = F_BODY_B; sp[n].flags = 0; sp[n].color = C_BRIGHT; n++;
     sp[n].s = T->fc_mid;  sp[n].n = -1; sp[n].font = F_BODY;   sp[n].flags = 0; sp[n].color = C_ICE; n++;
-    if (T->fc_paren[0]) { sp[n].s = T->fc_paren; sp[n].n = -1; sp[n].font = F_SMALL; sp[n].flags = 0; sp[n].color = C_MUTED; n++; }
+    sp[n].s = T->fc_left; sp[n].n = -1; sp[n].font = F_BODY;   sp[n].flags = 0; sp[n].color = C_MUTED; n++;
     return n;
 }
 
@@ -978,10 +922,10 @@ static int stats_layout(int x, int y, int w, bool draw)
     if (draw) {
         int xs = x0 + half + dp(16);
         caps_label(x0, yy, L"Wind", C_MUTED);
-        tx_ellipsis(F_VALUE, x0, yy + stat_lab_h(), half, T.wind, L.intro ? C_DIM : C_BRIGHT);
+        tx_ellipsis(F_VALUE, x0, yy + stat_lab_h(), half, T.wind, C_BRIGHT);
         meter(x0, yy + stat_lab_h() + fh(F_VALUE) + dp(5), 4, T.wind_lit, C_ACCENT);
         caps_label(xs, yy, L"Severity", C_MUTED);
-        tx_ellipsis(F_VALUE, xs, yy + stat_lab_h(), half, T.sev, L.intro ? C_DIM : T.lethal ? C_WARN : C_BRIGHT);
+        tx_ellipsis(F_VALUE, xs, yy + stat_lab_h(), half, T.sev, T.lethal ? C_WARN : C_BRIGHT);
         meter(xs, yy + stat_lab_h() + fh(F_VALUE) + dp(5), 5, T.sev_lit, T.lethal ? C_WARN : C_ACCENT);
     }
     yy += stats_row1_h() + dp(7);
@@ -999,7 +943,6 @@ static int stats_layout(int x, int y, int w, bool draw)
     yy += stat_lab_h();
     nsp = fc_spans(&T, sp);
     hh = rich(sp, nsp, x0, yy, iw, fh(F_BODY_B), draw);
-    if (draw && T.fc_full[0]) hot_add(x0, yy, x0 + iw, yy + hh, H_TIP, 0, true, T.fc_full);
     yy += hh;
     return yy + ip - y;
 }
@@ -1014,21 +957,22 @@ static IwdHourEffects s_fx;          /* never copied by value (items point into 
 
 static int fx_fill(const Live *L)
 {
+    int i, n = 0;
     if (L->intro) { s_fx.count = 0; return 0; }
     iwd_hour_effects(L->ev->id, L->hour, L->temp_f, g.a.celsius, &s_fx);
     if (s_fx.count > IWD_MAX_HOUR_EFFECTS) s_fx.count = IWD_MAX_HOUR_EFFECTS;
-    return s_fx.count;
+    /* the cold-table row repeats the hero's tier pill (one home per fact): not drawn */
+    for (i = 0; i < s_fx.count; i++)
+        if (s_fx.items[i].cat != IWD_CAT_CHILL) s_fx.items[n++] = s_fx.items[i];
+    s_fx.count = n;
+    return n;
 }
 
 /* Two type sizes: 15 px when the hour's effects fit the viewport with it (the usual case,
  * read at arm's length), else the compact 13 px plan (Blizzard, White Out). */
 static bool s_fx_big;
 
-static int fx_item_font(IwdCat c)
-{
-    if (s_fx_big) return c == IWD_CAT_CHILL ? F_FX_B : F_FX;
-    return c == IWD_CAT_CHILL ? F_SMALL_B : F_SMALL;
-}
+static int fx_item_font(void) { return s_fx_big ? F_FX : F_SMALL; }
 static int fx_bold_font(void) { return s_fx_big ? F_FX_B : F_SMALL_B; }
 static int fx_indent(void) { return dp(10); }
 static int fx_item_gap(void) { return s_fx_big ? dp(3) : dp(2); }
@@ -1053,7 +997,7 @@ static void fx_text(const IwdEffect *e, FxText *T, DWORD col)
 {
     const WCHAR *lab = wz(iwd_cat_label(e->cat));
     WCHAR *t = T->buf;
-    int n, i, ll = lstrlenW(lab), start = 0, f = fx_item_font(e->cat), fb = fx_bold_font();
+    int n, i, ll = lstrlenW(lab), start = 0, f = fx_item_font(), fb = fx_bold_font();
     DWORD cb = C_BRIGHT;
     to_w(e->text, t, IWD_EFFECT_TEXT_W);
     n = lstrlenW(t);
@@ -1094,7 +1038,7 @@ static void fx_text(const IwdEffect *e, FxText *T, DWORD col)
 static int fx_item_h(const IwdEffect *e, int w, int x, int y, DWORD col, bool draw)
 {
     static FxText T;
-    int f = fx_item_font(e->cat), lh = fh(f) > fh(fx_bold_font()) ? fh(f) : fh(fx_bold_font());
+    int f = fx_item_font(), lh = fh(f) > fh(fx_bold_font()) ? fh(f) : fh(fx_bold_font());
     fx_text(e, &T, col);
     if (!T.n) return fh(f);
     return rich(T.sp, T.n, x, y, w, lh, draw);
@@ -1156,9 +1100,8 @@ static int fx_plan(int w, int *cols_out, int *colw_out, int *colh_out, FxGroup *
     *ngr = 0;
     s_fx_big = false;
     if (s_fx.count == 0) {
-        int ph = wrap(F_SMALL_I, 0, 0, iw, L"Effects of the current weather will appear here, hour by hour.", C_MUTED, false);
-        *cols_out = 1; *colw_out = iw; *colh_out = ph;
-        return fixed + ph;
+        *cols_out = 1; *colw_out = iw; *colh_out = 0;
+        return fixed;
     }
     /* pass 0: large type, accepted only if it fits; pass 1: compact (unchanged plan) */
     for (pass = 0; pass < 2; pass++) {
@@ -1192,7 +1135,6 @@ static void effects_paint(int x, int y, int w, int h)
     Live L; FxGroup gr[IWD_MAX_HOUR_EFFECTS]; int col_of[IWD_MAX_HOUR_EFFECTS];
     int cols, colw, colh, n, i, x0 = x + FX_PAD, yy = y + FX_PAD, cg = dp(16);
     int cur_col = -1, cy = 0;
-    WCHAR note[96];
 
     live_get(&L);
     fx_fill(&L);
@@ -1200,43 +1142,25 @@ static void effects_paint(int x, int y, int w, int h)
     panel_bg(x, y, w, h);
 
     tx_caps(F_CAPS, x0, yy, L"Effects in play", C_SOFT);
-    if (L.intro) lstrcpyW(note, L"no weather yet");
-    else {
-        WCHAR nm[64];
-        to_w(L.ev->name, nm, 64);
-        wsprintfW(note, L"%d in play \x00B7 %s", s_fx.count, nm);
-    }
-    {
-        int cw = tw_caps(F_CAPS, L"Effects in play") + dp(14);
-        int nx = x + w - FX_PAD - tw(F_SMALL, note, -1);
-        if (nx < x0 + cw) nx = x0 + cw;
-        tx_ellipsis(F_SMALL, nx, yy + (fh(F_CAPS) - fh(F_SMALL)) / 2, x + w - FX_PAD - nx, note, C_MUTED);
-    }
     yy += fx_head_h();
-
-    if (s_fx.count == 0) {
-        wrap(F_SMALL_I, x0, yy, w - 2 * FX_PAD, L"Effects of the current weather will appear here, hour by hour.", C_MUTED, true);
-        return;
-    }
+    if (s_fx.count == 0) return;
     fx_pack(gr, n, colh, col_of);
     for (i = 0; i < n; i++) {
         const FxGroup *G = &gr[i];
         DWORD col = cat_rgb(G->cat);
         int gx, gy, k, ty;
-        bool chill = G->cat == IWD_CAT_CHILL;
         if (col_of[i] != cur_col) { cur_col = col_of[i]; cy = yy; }
         else cy += fx_group_gap();
         gx = x0 + cur_col * (colw + cg);
         gy = cy;
         if (gy < g_tgt->h && gy + G->h > 0) {
-            if (chill) px_fill(gx, gy - dp(2), gx + colw, gy + G->h + dp(2), mix(C_PANEL, C_ACCENT, 20));
-            px_fill(gx, gy + dp(1), gx + dp(2), gy + G->h, mix(C_PANEL, col, chill ? 230 : 150));
+            px_fill(gx, gy + dp(1), gx + dp(2), gy + G->h, mix(C_PANEL, col, 150));
             tx_caps(F_CAPS_S, gx + fx_indent(), gy, wz(iwd_cat_label(G->cat)), mix(C_PANEL, col, 225));
             ty = gy + fh(F_CAPS_S) + fx_label_gap();
             for (k = 0; k < G->count; k++) {
                 const IwdEffect *e = &s_fx.items[G->first + k];
                 if (k > 0) ty += fx_item_gap();
-                ty += fx_item_h(e, colw - fx_indent(), gx + fx_indent(), ty, chill ? C_BRIGHT : C_TEXT, true);
+                ty += fx_item_h(e, colw - fx_indent(), gx + fx_indent(), ty, C_TEXT, true);
             }
         }
         cy += G->h;
@@ -1245,25 +1169,32 @@ static void effects_paint(int x, int y, int w, int h)
 
 /* ================================================================== FOOT */
 
-static const WCHAR *k_foot1 = L"Rules from Icewind Dale: Weather Events and Effects. Duration rolls decide the next event (shorter half improves, longer half shifts).";
-static const WCHAR *k_foot_keys = L"Keys (F1 for all): \x2192 / Space next hour \x00B7 \x2190 previous hour \x00B7 N advance day \x00B7 Ctrl+Z step back \x00B7 PgUp / PgDn view day \x00B7 T today \x00B7 E new event \x00B7 O note \x00B7 P play \x00B7 U \x00B0" L"F/\x00B0" L"C \x00B7 M sound \x00B7 F2 settings";
-static const WCHAR *k_foot_link = L"Campaign settings\x2026";
+/* One row: the dice chip (left) that opens the ledger under it, and the rules credit. */
+static const WCHAR *k_credit = L"Rules: Icewind Dale \x2014 Weather Events and Effects";
 
-static int foot_layout(int x, int y, int w, bool draw)
+static int foot_h(void) { return dp(34); }
+
+static void foot_paint(int x, int y, int w)
 {
-    int yy = y + dp(4), lw = tw(F_SMALL, k_foot_link, -1), tw1 = w - lw - dp(24), h1;
-    if (tw1 < dp(200)) tw1 = w;
-    h1 = wrap(F_SMALL, x, yy, tw1, k_foot1, C_DIM, draw);
-    if (draw) {
-        int lx = tw1 == w ? x : x + w - lw, ly = tw1 == w ? yy + h1 + dp(4) : yy;
-        bool hot = is_hot(H_FOOT_SETTINGS);
-        tx(F_SMALL, lx, ly, k_foot_link, -1, hot ? C_BRIGHT : C_ACCENT);
-        px_fill(lx, ly + fh(F_SMALL) - dp(1), lx + lw, ly + fh(F_SMALL), hot ? C_BRIGHT : mix(C_BG, C_ACCENT, 110));
-        hot_add(lx - dp(2), ly - dp(2), lx + lw + dp(2), ly + fh(F_SMALL) + dp(2), H_FOOT_SETTINGS, 0, true, L"Open Settings (F2)");
+    int s = dp(26), cy = y + foot_h() / 2, c0 = cy - s / 2, gs = dp(15), gx = x + (s - gs) / 2, gy = c0 + (s - gs) / 2;
+    int pip = dp(3) < 2 ? 2 : dp(3), step = (gs - 4 - pip) / 2, k;
+    bool open = g.a.native.ledger, hot = is_hot(H_LEDGER);
+    DWORD fill = open || hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2;
+    DWORD border = open ? mix(C_FRAME, C_ACCENT, 150) : hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME;
+    DWORD ink = hot || open ? C_BRIGHT : C_SOFT;
+    px_box(x, c0, x + s, c0 + s, fill, border);
+    /* a die: outlined face with three pixel-crisp pips on the diagonal */
+    px_frame(gx, gy, gx + gs, gy + gs, 1, ink);
+    for (k = 0; k < 3; k++) {
+        int o = 2 + k * step;
+        px_fill(gx + o, gy + o, gx + o + pip, gy + o + pip, ink);
     }
-    yy += h1 + (tw1 == w ? fh(F_SMALL) + dp(4) : 0) + dp(6);
-    yy += wrap(F_TINY, x, yy, w, k_foot_keys, C_DIM, draw);
-    return yy - y + dp(4);
+    hot_add(x, c0, x + s, c0 + s, H_LEDGER, 0, true,
+            open ? L"Hide the dice ledger" : L"Show the dice ledger (the rolls behind this day)");
+    {
+        int cw = tw(F_TINY, k_credit, -1), cx = x + w - cw;
+        if (cx >= x + s + dp(16)) tx(F_TINY, cx, cy - fh(F_TINY) / 2, k_credit, -1, C_DIM);
+    }
 }
 
 /* ================================================================== measure / paint dispatch */
@@ -1275,7 +1206,7 @@ static int blk_measure(int which, int w)
     case BLK_CONTROLS: return controls_measure(w);
     case BLK_STATS:    return stats_layout(0, 0, w, false);
     case BLK_EFFECTS:  return effects_measure(w);
-    case BLK_FOOT:     return foot_layout(0, 0, w, false);
+    case BLK_FOOT:     return foot_h();
     case BLK_TIMELINE: case BLK_LEDGER:  return blk_time_measure(which, w);
     case BLK_CALENDAR: case BLK_DAY:     return blk_cal_measure(which, w);
     default: return 0;
@@ -1290,7 +1221,7 @@ static void blk_paint(int which, int x, int y, int w, int h)
     case BLK_CONTROLS: if (vis) controls_paint(x, y, w, h); break;
     case BLK_STATS:    if (vis) { panel_bg(x, y, w, h); stats_layout(x, y, w, true); } break;
     case BLK_EFFECTS:  if (vis) effects_paint(x, y, w, h); break;
-    case BLK_FOOT:     if (vis) foot_layout(x, y, w, true); break;
+    case BLK_FOOT:     if (vis) foot_paint(x, y, w); break;
     case BLK_TIMELINE: case BLK_LEDGER:  blk_time_paint(which, x, y, w, h); break;
     case BLK_CALENDAR: case BLK_DAY:     blk_cal_paint(which, x, y, w, h); break;
     default: break;
@@ -1309,6 +1240,7 @@ void view_layout(void)
     int W = client_w(), vh = view_h();
     int pad = dp(12), gap = dp(12), rm = dp(16);
     int xl = pad, total = W - rm - xl, y, yl, yr, h;
+    bool live = alm_has_view(&g.a);        /* before the first dawn: no stats, effects, timeline */
     Surface *prev = g_tgt;
     if (!g_tgt && g.back.dc) g_tgt = &g.back;       /* measure on the back buffer's DC */
     if (total < dp(200)) total = dp(200);
@@ -1317,27 +1249,28 @@ void view_layout(void)
 
     if (g.wide) {
         int wl = (total - gap) * 56 / 100, wr = total - gap - wl, xr = xl + wl + gap;
-        int tl_h, hero_h, lim, hmin;
-        /* right column: live controls, stats, effects (kept inside the viewport), ledger */
+        int tl_h = 0, hero_h, lim, hmin;
+        /* right column: live controls, stats, effects (kept inside the viewport), the day */
         yr = pad;
         h = blk_measure(BLK_CONTROLS, wr); put(BLK_CONTROLS, xr, yr, wr, h); yr += h + gap;
-        h = blk_measure(BLK_STATS, wr);    put(BLK_STATS, xr, yr, wr, h);    yr += h + gap;
-        s_fx_avail = vh - yr - pad;
-        if (s_fx_avail < dp(180)) s_fx_avail = vh - 2 * pad;
-        h = blk_measure(BLK_EFFECTS, wr);  put(BLK_EFFECTS, xr, yr, wr, h);  yr += h + gap;
-        h = blk_measure(BLK_LEDGER, wr);   put(BLK_LEDGER, xr, yr, wr, h);   yr += h + gap;
-        /* the selected day's panel under the ledger, beside the calendar (below the fold) */
+        if (live) {
+            h = blk_measure(BLK_STATS, wr);    put(BLK_STATS, xr, yr, wr, h);    yr += h + gap;
+            s_fx_avail = vh - yr - pad;
+            if (s_fx_avail < dp(180)) s_fx_avail = vh - 2 * pad;
+            h = blk_measure(BLK_EFFECTS, wr);  put(BLK_EFFECTS, xr, yr, wr, h);  yr += h + gap;
+        }
+        /* the selected day's events and notes rise directly under the effects */
         h = blk_measure(BLK_DAY, wr);      put(BLK_DAY, xr, yr, wr, h);      yr += h;
         /* left column: hero sized so hero + timeline fit the viewport */
-        tl_h = blk_measure(BLK_TIMELINE, wl);
+        if (live) tl_h = blk_measure(BLK_TIMELINE, wl);
         hmin = blk_measure(BLK_HERO, wl);
         hero_h = clampi(wl * 42 / 100, dp(280), dp(400));
-        lim = vh - 2 * pad - gap - tl_h;
+        lim = vh - 2 * pad - (live ? gap + tl_h : 0);
         if (hero_h > lim) hero_h = lim > dp(240) ? lim : dp(240);
         if (hero_h < hmin) hero_h = hmin;
         yl = pad;
         put(BLK_HERO, xl, yl, wl, hero_h);      yl += hero_h + gap;
-        put(BLK_TIMELINE, xl, yl, wl, tl_h);    yl += tl_h + gap;
+        if (live) { put(BLK_TIMELINE, xl, yl, wl, tl_h); yl += tl_h + gap; }
         h = blk_measure(BLK_CALENDAR, wl); put(BLK_CALENDAR, xl, yl, wl, h); yl += h;
         y = (yl > yr ? yl : yr) + gap * 2;
     } else {
@@ -1348,25 +1281,40 @@ void view_layout(void)
         if (hero_h < hmin) hero_h = hmin;
         put(BLK_HERO, xl, y, w, hero_h); y += hero_h + gap;
         h = blk_measure(BLK_CONTROLS, w); put(BLK_CONTROLS, xl, y, w, h); y += h + gap;
-        h = blk_measure(BLK_STATS, w);    put(BLK_STATS, xl, y, w, h);    y += h + gap;
-        /* the rules in play before the timeline: they are what the DM reads out */
-        s_fx_avail = vh - 2 * pad;
-        h = blk_measure(BLK_EFFECTS, w);  put(BLK_EFFECTS, xl, y, w, h);  y += h + gap;
-        h = blk_measure(BLK_TIMELINE, w); put(BLK_TIMELINE, xl, y, w, h); y += h + gap;
+        if (live) {
+            h = blk_measure(BLK_STATS, w);    put(BLK_STATS, xl, y, w, h);    y += h + gap;
+            /* the rules in play before the timeline: they are what the DM reads out */
+            s_fx_avail = vh - 2 * pad;
+            h = blk_measure(BLK_EFFECTS, w);  put(BLK_EFFECTS, xl, y, w, h);  y += h + gap;
+            h = blk_measure(BLK_TIMELINE, w); put(BLK_TIMELINE, xl, y, w, h); y += h + gap;
+        }
         h = blk_measure(BLK_CALENDAR, w); put(BLK_CALENDAR, xl, y, w, h); y += h + gap;
-        h = blk_measure(BLK_DAY, w);      put(BLK_DAY, xl, y, w, h);      y += h + gap;
-        h = blk_measure(BLK_LEDGER, w);   put(BLK_LEDGER, xl, y, w, h);   y += h;
+        h = blk_measure(BLK_DAY, w);      put(BLK_DAY, xl, y, w, h);      y += h;
         y += gap * 2;
     }
-    h = blk_measure(BLK_FOOT, total);
+    h = foot_h();
     put(BLK_FOOT, xl, y, total, h);
-    g.content_h = y + h + pad;
+    y += h;
+    /* the dice ledger opens under the footer row, so its chip stays where it was */
+    if (g.a.native.ledger) {
+        int lw = total < dp(620) ? total : dp(620);
+        y += dp(8);
+        h = blk_measure(BLK_LEDGER, lw);
+        put(BLK_LEDGER, xl, y, lw, h);
+        y += h;
+    }
+    g.content_h = y + pad;
     g.scroll = clampi(g.scroll, 0, max_scroll());
     g.layout_dirty = false;
     g_tgt = prev;
 }
 
 /* ================================================================== header */
+
+static bool viewing_other_day(void)
+{
+    return alm_has_view(&g.a) && g.a.current >= 0 && g.a.view != g.a.current;
+}
 
 static void header_paint(int W)
 {
@@ -1376,12 +1324,12 @@ static void header_paint(int W)
     px_fill(0, hh - 1, W, hh, C_LINE);
     hot_add(0, 0, W, hh, H_NONE, 0, false, NULL);           /* covers the page under the header */
 
-    /* tools, right to left: Settings, Sound, F/C, Seed */
+    /* tools, right to left: Settings, Sound, F/C, ? */
     rx = right;
     {
         const WCHAR *s = L"Settings";
         int w = tw(F_BTN, s, -1) + dp(20);
-        button(rx - w, cy0, rx, cy1, H_SETTINGS, true, s, F_BTN, NULL, L"Settings (F2)");
+        button(rx - w, cy0, rx, cy1, H_SETTINGS, true, s, F_BTN, L"Settings (F2)");
         rx -= w + dp(8);
     }
     {
@@ -1409,30 +1357,9 @@ static void header_paint(int W)
             tx_center(F_BTN, (a0 + a1) / 2, cy - fh(F_BTN) / 2, i ? L"\x00B0" L"C" : L"\x00B0" L"F",
                       act ? C_BRIGHT : hot ? C_TEXT : C_MUTED);
             hot_add(a0, cy0, a1, cy1, i ? H_UNIT_C : H_UNIT_F, 0, true,
-                    i ? L"Show temperatures in \x00B0" L"C (U)" : L"Show temperatures in \x00B0" L"F (U)");
+                    i ? L"Show temperatures in \x00B0" L"C" : L"Show temperatures in \x00B0" L"F");
         }
         rx = x0 - dp(8);
-    }
-    {
-        const WCHAR *lab = L"SEED";
-        WCHAR seed[96];
-        int lw, vw, w, maxw, x0;
-        bool hot = is_hot(H_SEED);
-        to_w(g.a.seed ? g.a.seed : "", seed, 96);
-        lw = tw(F_CAPS_S, lab, -1) + dp(1) * 4;
-        vw = tw(F_MONO, seed, -1);
-        maxw = rx - x - dp(260);
-        if (maxw > dp(260)) maxw = dp(260);
-        w = dp(10) + lw + dp(8) + vw + dp(10);
-        if (w > maxw) w = maxw;
-        if (w > lw + dp(48)) {
-            x0 = rx - w;
-            px_box(x0, cy0, rx, cy1, hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2, hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME);
-            tx_caps(F_CAPS_S, x0 + dp(10), cy - fh(F_CAPS_S) / 2, lab, C_MUTED);
-            tx_ellipsis(F_MONO, x0 + dp(10) + lw + dp(8), cy - fh(F_MONO) / 2, w - lw - dp(28), seed, C_ICE);
-            hot_add(x0, cy0, rx, cy1, H_SEED, 0, true, L"Expedition seed (opens Settings)");
-            rx = x0 - dp(8);
-        }
     }
     {   /* keyboard shortcuts */
         int s = ch, x0 = rx - s;
@@ -1465,7 +1392,7 @@ static void header_paint(int W)
             WCHAR clk[16];
             alm_hero(&g.a, &hr);
             iwd_format_date(hr.abs, true, b, sizeof b); to_w(b, wd, IWD_DATE_CAP);
-            iwd_fmt_clock(g.a.time, b, sizeof b); to_w(b, clk, 16);
+            view_clock_text(clk);
             to_w(L.ev->name, wn, 64);
             iwd_fmt_temp(L.temp_f, g.a.celsius, b, sizeof b); to_w(b, wt, 30);
             if (lstrlenW(wt) > 0 && wt[lstrlenW(wt) - 1] == 0x00B0) lstrcatW(wt, g.a.celsius ? L"C" : L"F");
@@ -1479,6 +1406,11 @@ static void header_paint(int W)
             if (viewing_other_day() && room - cx > dp(160)) {
                 pill(F_SMALL_B, cx, cy - pill_h(F_SMALL_B) / 2, wz(hr.tag), 0xFFC999, true, true);
                 cx += pill(F_SMALL_B, 0, 0, wz(hr.tag), 0, false, false) + dp(8);
+            }
+            {   /* tight (narrow window, "Tomorrow" pill): keep the DC, drop the tier's name */
+                int need = 0;
+                for (i = 0; i < np; i++) need += tw(part[i].f, part[i].s, -1) + (i ? tw(F_BODY, L"  \x00B7  ", -1) : 0);
+                if (cx + need > room) wsprintfW(wtier, L"DC %d", L.cold.dc);
             }
             for (i = 0; i < np && cx < room; i++) {
                 const WCHAR *sep = L"  \x00B7  ";
@@ -1577,22 +1509,19 @@ static void toast_paint(int W, int H)
 static void keys_paint(int W, int H)
 {
     static const WCHAR *const k[][2] = {
-        { L"\x2192  Space", L"Next hour (midnight on today advances the day)" },
-        { L"\x2190", L"Previous hour" },
-        { L"Home  End", L"00:00 / 23:00" },
+        { L"\x2192  Space", L"Forward 1 hour" },
+        { L"\x2190", L"Back 1 hour" },
+        { L"Shift+\x2190 \x2192", L"30 minutes" },
+        { L"Ctrl+\x2190 \x2192", L"5 minutes" },
         { L"N", L"Advance the party to the next day" },
-        { L"Ctrl+Z", L"Step back (undo the last advance or make-today)" },
+        { L"Ctrl+Z", L"Step back" },
         { L"PgUp  PgDn", L"View the previous / next day" },
         { L"T  Esc", L"Back to today" },
-        { L"P", L"Play / pause the day" },
-        { L"E", L"New event or reminder on the viewed day" },
-        { L"O", L"Write a note for the viewed day" },
-        { L"Tab", L"Calendar grid: arrows move, Enter views, Shift+Enter makes it today" },
-        { L"U", L"\x00B0" L"F / \x00B0" L"C" },
+        { L"E", L"New event or reminder" },
+        { L"O", L"Write a note" },
         { L"M", L"Wind sound" },
         { L"F2", L"Settings" },
-        { L"Ctrl+C", L"Copy the seed" },
-        { L"F1  ?", L"This card" },
+        { L"F1", L"This card" },
     };
     int n = (int)(sizeof k / sizeof k[0]), i, pad = dp(18), rowh = fh(F_SMALL) + dp(8);
     int kw = 0, aw = 0, cols, rows, bw, bh, x0, y0, colw;
@@ -1631,7 +1560,7 @@ static void keys_paint(int W, int H)
         }
         tx_ellipsis(F_SMALL, cx + kw + dp(12), cy + (rowh - fh(F_SMALL)) / 2 - dp(1), colw - kw - dp(12), k[i][1], C_TEXT);
     }
-    tx(F_TINY, x0 + pad, y0 + bh - pad - fh(F_TINY), L"Right-click a calendar day for more \x00B7 any key or click closes this card", -1, C_MUTED);
+    tx(F_TINY, x0 + pad, y0 + bh - pad - fh(F_TINY), L"Any key or click closes this card", -1, C_MUTED);
     hot_add(0, view_header_h(), W, H, H_KEYS_CARD, 0, true, NULL);
 }
 

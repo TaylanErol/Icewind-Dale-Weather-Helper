@@ -224,10 +224,10 @@ static void test_round_trip(const char *tmpdir)
     a.native.has_rect = true;
     a.native.win_x = -8; a.native.win_y = 20; a.native.win_w = 1280; a.native.win_h = 760;
     a.native.maximized = true;
-    a.native.tab = 2;
+    a.native.ledger = true;
     alm_step_day(&a, -3);
     CHECK(a.view == 6 && a.current == 9, "step day");
-    alm_set_time(&a, 7.25, true);
+    alm_set_time(&a, 7.25);
 
     char path[2100], dir[1024];
     snprintf(dir, sizeof dir, "%s/deep/er/dir", tmpdir);
@@ -249,7 +249,7 @@ static void test_round_trip(const char *tmpdir)
     char *s1 = snap(&a, true), *s2 = snap(&b, true);
     CHECK_STR(s2, s1);
     CHECK(b.native.sound && b.native.has_rect && b.native.win_x == -8 && b.native.win_w == 1280 && b.native.maximized &&
-          b.native.tab == 2, "native prefs");
+          b.native.ledger, "native prefs");
     CHECK(b.n_days == 10 && memcmp(a.days, b.days, sizeof(IwdDay) * 10) == 0, "days rebuilt identically");
     CHECK(b.chain.rng_state == a.chain.rng_state, "chain state");
     free(s1); free(s2);
@@ -257,17 +257,17 @@ static void test_round_trip(const char *tmpdir)
     /* export never carries "native"; import keeps the importer's native prefs */
     AlmBuf ex = {0};
     CHECK(alm_export_json(&a, ISO, &ex), "export");
-    CHECK(strstr(ex.data, "\"native\"") == NULL, "export has no native");
+    CHECK(strstr(ex.data, "\"native\"") == NULL && strstr(ex.data, "ledger") == NULL, "export has no native");
     CHECK(strncmp(ex.data, "{\n  \"app\": \"icewind-dale-almanac\",\n  \"exported\": \"2026-11-19T18:04:05.123Z\",\n  \"v\": 2,", 80) == 0,
           "export head");
     Almanac c;
     alm_init(&c, 5);
-    c.native.tab = 4;
+    c.native.ledger = true;
     c.busy = true;
     CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_BUSY, "import busy");
     c.busy = false;
     CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_OK, "import");
-    CHECK(c.native.tab == 4 && !c.native.sound, "import keeps native prefs");
+    CHECK(c.native.ledger && !c.native.sound, "import keeps native prefs");
     s1 = snap(&a, false); s2 = snap(&c, false);
     CHECK_STR(s2, s1);
     free(s1); free(s2);
@@ -319,18 +319,15 @@ static void test_actions(void)
     CHECK_STR(h.day_label, "Before the First Dawn");
     alm_controls(&a, &ct);
     CHECK_STR(ct.main, "Begin the Expedition");
-    CHECK_STR(ct.sub, "d12 opens 1 Hammer 1489 DR");
-    CHECK_STR(ct.day_nav, "No days yet");
+    CHECK(ct.advance_enabled && !ct.prev_enabled && !ct.next_enabled, "intro controls");
     CHECK(alm_fmt_announce(&a, buf, sizeof buf) == 0, "no announce in the intro");
-    CHECK(alm_step_hour(&a, 1).fx & ALM_FX_REJECTED, "no hour step in the intro");
-    CHECK(alm_toggle_play(&a).fx & ALM_FX_REJECTED, "no play in the intro");
+    CHECK(alm_step_minutes(&a, 60).fx & ALM_FX_REJECTED, "no time step in the intro");
 
     AlmResult r = alm_advance(&a, 12);
     CHECK(a.current == 0 && a.time == 12, "begin");
     alm_controls(&a, &ct);
     CHECK_STR(ct.main, "Advance to 2 Hammer");
-    CHECK(strstr(ct.sub, "carries on \xC2\xB7 ") || strstr(ct.sub, "rolls in at midnight"), "sub %s", ct.sub);
-    CHECK_STR(ct.day_nav, "1 Hammer \xC2\xB7 Day 1");
+    CHECK(!ct.prev_enabled && ct.next_enabled, "day 1 navigator");
     alm_hero(&a, &h);
     CHECK_STR(h.tag, "Today");
     CHECK_STR(h.day_label, "Day 1 of the expedition");
@@ -338,35 +335,22 @@ static void test_actions(void)
     CHECK(strncmp(buf, "1 Hammer 1489 DR, day 1, 12:00: ", 32) == 0, "announce %s", buf);
 
     /* hour stepping */
-    r = alm_step_hour(&a, 1);
+    r = alm_step_minutes(&a, 60);
     CHECK(a.time == 13 && (r.fx & ALM_FX_SAVE) && (r.fx & ALM_FX_ANNOUNCE), "hour +1");
-    alm_set_time(&a, 23.4, true);
-    r = alm_step_hour(&a, 1);
-    CHECK(a.current == 1 && a.view == 1 && a.time == 0 && a.n_days == 2, "23:00 + 1 on today advances, lands 00:00");
+    alm_set_time(&a, 23);
+    r = alm_step_minutes(&a, 60);
+    CHECK(a.current == 1 && a.view == 1 && a.time == 0 && a.n_days == 2, "23:00 + 1 h on today advances, lands 00:00");
     CHECK(strcmp(r.toast_lead, "Today") == 0, "lead today");
-    r = alm_step_hour(&a, -1);
-    CHECK(a.view == 0 && a.time == 23 && a.current == 1, "00:00 - 1 goes to the previous day 23:00");
-    r = alm_step_hour(&a, 1);
-    CHECK(a.view == 1 && a.time == 0 && a.current == 1 && a.n_days == 2, "23:00 + 1 on a past day moves on");
+    r = alm_step_minutes(&a, -60);
+    CHECK(a.view == 0 && a.time == 23 && a.current == 1, "00:00 - 1 h goes to the previous day 23:00");
+    r = alm_step_minutes(&a, 60);
+    CHECK(a.view == 1 && a.time == 0 && a.current == 1 && a.n_days == 2, "23:00 + 1 h on a past day moves on");
     alm_step_day(&a, -1);
     CHECK(a.view == 0, "step day back");
-    alm_set_time(&a, 0.5, true);
-    r = alm_step_hour(&a, -1);
-    CHECK((r.fx & ALM_FX_REJECTED) && a.view == 0, "no hour before day 1");
-
-    /* playback */
-    alm_set_time(&a, 23.95, true);
-    r = alm_toggle_play(&a);
-    CHECK(a.playing && a.time == 0, "play restarts a finished day");
-    r = alm_play_tick(&a, 18.8);
-    r = alm_toggle_play(&a);
-    CHECK(!a.playing && a.time == 18 && (r.fx & ALM_FX_SAVE), "pause settles on the whole hour (%g)", a.time);
-    r = alm_toggle_play(&a);
-    CHECK(a.playing && a.time == 18, "resume from the whole hour");
-    r = alm_play_tick(&a, 6);
-    CHECK(a.view == 1 && a.time < 1 && a.playing, "play into the next recorded day");
-    r = alm_play_tick(&a, 24);
-    CHECK(!a.playing && a.time == 23.99 && (r.fx & ALM_FX_BECKON) && a.view == 1, "stops at the end of today");
+    alm_set_time(&a, 0.5);
+    r = alm_step_minutes(&a, -60);
+    CHECK((r.fx & ALM_FX_REJECTED) && a.view == 0 && a.time == 0.5, "no hour before day 1");
+    CHECK(alm_step_minutes(&a, 0).fx & ALM_FX_REJECTED, "delta 0 rejected");
 
     /* select / set current */
     r = alm_select(&a, IWD_DEFAULT_START_ABS + 5, true);
@@ -534,10 +518,107 @@ static void test_actions(void)
     CHECK_STR(ct.main, "The Almanac Is Full");
     CHECK(!ct.advance_enabled && !ct.next_enabled, "full controls");
     CHECK(alm_advance(&full, 12).fx & ALM_FX_REJECTED, "cannot advance a full almanac");
-    alm_set_time(&full, 23, true);
-    CHECK(alm_step_hour(&full, 1).fx & ALM_FX_REJECTED, "no hour past the last day");
+    alm_set_time(&full, 23);
+    CHECK(alm_step_minutes(&full, 60).fx & ALM_FX_REJECTED, "no hour past the last day");
+    alm_set_time(&full, 1420 / 60.0);
+    r = alm_step_minutes(&full, 30);
+    CHECK((r.fx & ALM_FX_REJECTED) && full.current == 3649 && alm_minute_now(&full) == 1420,
+          "full almanac: 23:40 + 30 min rejected, unchanged");
     alm_free(&full);
 
+    alm_free(&a);
+}
+
+/* minute stepping (SPEC 6.2): exact minutes / 60.0, midnight in both directions */
+static void test_minutes(const char *tmpdir)
+{
+    Almanac a = fresh("MINUTES", 3);
+    AlmResult r;
+    CHECK(a.current == 2 && a.view == 2 && a.time == 12 && alm_minute_now(&a) == 720, "fresh at 12:00");
+    r = alm_step_minutes(&a, 5);
+    CHECK(a.time == 725 / 60.0 && alm_minute_now(&a) == 725 && (r.fx & ALM_FX_SAVE) && (r.fx & ALM_FX_RENDER_HOUR),
+          "12:00 + 5 min (%.17g)", a.time);
+    r = alm_step_minutes(&a, 30);
+    CHECK(a.time == 755 / 60.0 && alm_minute_now(&a) == 755, "+ 30 min");
+    r = alm_step_minutes(&a, -5);
+    CHECK(a.time == 750 / 60.0 && alm_minute_now(&a) == 750 && alm_hour_now(&a) == 12, "- 5 min");
+    for (int m = 0; m < 1440; m++) {          /* every stored minute reads back as itself */
+        alm_set_time(&a, m / 60.0);
+        if (alm_minute_now(&a) != m || alm_hour_now(&a) != m / 60) { CHECK(0, "minute %d reads %d", m, alm_minute_now(&a)); break; }
+    }
+
+    /* forward past midnight on today: an advance landing at the carried-over minute */
+    alm_set_time(&a, 1420 / 60.0);
+    r = alm_step_minutes(&a, 30);
+    CHECK(a.current == 3 && a.view == 3 && a.n_days == 4 && alm_minute_now(&a) == 10 && a.time == 10 / 60.0,
+          "23:40 + 30 on today -> next day 00:10");
+    CHECK(r.toast_lead && strcmp(r.toast_lead, "Today") == 0 && (r.fx & ALM_FX_SAVE), "advance result");
+    CHECK(a.sel_abs == alm_abs_of(&a, 3) && a.current_abs == alm_abs_of(&a, 3), "today and the selection moved");
+
+    /* backward past midnight on today: only the view changes */
+    r = alm_step_minutes(&a, -30);
+    CHECK(a.view == 2 && a.current == 3 && alm_minute_now(&a) == 1420 && a.time == 1420 / 60.0,
+          "00:10 - 30 on today -> yesterday 23:40, today unchanged");
+    CHECK(a.sel_abs == alm_abs_of(&a, 2), "selection follows the view");
+
+    /* forward past midnight on a past day: on to the next day, today unchanged */
+    r = alm_step_minutes(&a, 30);
+    CHECK(a.view == 3 && a.current == 3 && a.n_days == 4 && alm_minute_now(&a) == 10, "23:40 + 30 on a past day");
+    alm_select(&a, alm_abs_of(&a, 1), false);
+    alm_set_time(&a, 1380 / 60.0);
+    r = alm_step_minutes(&a, 60);
+    CHECK(a.view == 2 && a.current == 3 && a.time == 0, "23:00 + 1 h on a past day lands 00:00");
+
+    /* day 1 cannot go back before 00:00 */
+    alm_select(&a, a.start_abs, false);
+    alm_set_time(&a, 10 / 60.0);
+    r = alm_step_minutes(&a, -30);
+    CHECK((r.fx & ALM_FX_REJECTED) && a.view == 0 && a.current == 3 && alm_minute_now(&a) == 10,
+          "day 1 00:10 - 30 rejected, unchanged");
+    r = alm_step_minutes(&a, -5);
+    CHECK(!(r.fx & ALM_FX_REJECTED) && alm_minute_now(&a) == 5, "day 1 00:10 - 5 stays on the day");
+    CHECK(alm_step_minutes(&a, 1440).fx & ALM_FX_REJECTED, "a whole day is not a step");
+
+    /* a legacy fractional time from a web backup */
+    alm_set_time(&a, 13.7283);
+    CHECK(alm_minute_now(&a) == 823 && alm_hour_now(&a) == 13, "13.7283 reads 13:43 (%d)", alm_minute_now(&a));
+    r = alm_step_minutes(&a, 5);
+    CHECK(alm_minute_now(&a) == 828 && a.time == 828 / 60.0, "13:43 + 5 -> 13:48 exactly");
+    alm_set_time(&a, 23.9999);
+    CHECK(alm_minute_now(&a) == 1439, "23.9999 reads 23:59");
+
+    /* busy */
+    a.busy = true;
+    CHECK(alm_step_minutes(&a, 5).fx & ALM_FX_REJECTED, "busy rejects");
+    a.busy = false;
+
+    /* save / load keeps the exact minute and the ledger preference; "tab" is gone */
+    alm_set_time(&a, 725 / 60.0);
+    a.native.ledger = true;
+    char path[1100];
+    snprintf(path, sizeof path, "%s/minutes.json", tmpdir);
+    CHECK(alm_save_file(&a, path) == ALM_IO_OK, "save minutes");
+    Almanac b;
+    alm_init(&b, 4);
+    CHECK(alm_load_file(&b, path) == ALM_LOAD_OK, "load minutes");
+    CHECK(b.time == 725 / 60.0 && alm_minute_now(&b) == 725 && b.native.ledger, "time 725/60 and ledger survive");
+    AlmBuf sb = {0};
+    alm_snapshot_json(&b, true, &sb);
+    CHECK(strstr(sb.data, "\"ledger\":true") != NULL && strstr(sb.data, "\"tab\"") == NULL, "native.ledger written");
+    alm_buf_free(&sb);
+    AlmBuf ex = {0};
+    alm_export_json(&b, ISO, &ex);
+    CHECK(strstr(ex.data, "\"native\"") == NULL && strstr(ex.data, "ledger") == NULL, "ledger never exported");
+    alm_buf_free(&ex);
+    alm_free(&b);
+    const char *old = "{\"v\":2,\"seed\":\"X\",\"dayCount\":1,\"native\":{\"sound\":true,\"tab\":3}}";
+    alm_init(&b, 4);
+    CHECK(alm_load_json(&b, old, strlen(old)) == ALM_LOAD_OK && !b.native.ledger && b.native.sound, "old tab key ignored");
+    alm_free(&b);
+    const char *on = "{\"v\":2,\"seed\":\"X\",\"native\":{\"ledger\":1}}";
+    alm_init(&b, 4);
+    CHECK(alm_load_json(&b, on, strlen(on)) == ALM_LOAD_OK && !b.native.ledger, "ledger must be true, not truthy");
+    alm_free(&b);
     alm_free(&a);
 }
 
@@ -725,9 +806,10 @@ static void test_fuzz(const char *cases_path)
             check_valid(&x, "mutation");
             if (st == ALM_LOAD_OK && it % 7 == 0) {
                 exercise(&x);
-                alm_step_hour(&x, 1);
+                alm_step_minutes(&x, 60);
                 alm_advance(&x, 12);
-                alm_step_hour(&x, -1);
+                alm_step_minutes(&x, -30);
+                alm_step_minutes(&x, 5);
                 check_valid(&x, "actions after mutation");
             }
             alm_free(&x);
@@ -745,6 +827,7 @@ int main(int argc, char **argv)
     run_cases(argv[1]);
     test_round_trip(argv[2]);
     test_actions();
+    test_minutes(argv[2]);
     test_malformed();
     test_fuzz(argv[1]);
     if (g_fail) { fprintf(stderr, "store tests: %d of %d checks FAILED\n", g_fail, g_checks); return 1; }
