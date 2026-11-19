@@ -1,0 +1,753 @@
+/* Host tests for store.c.
+ *   test_store CASES_FILE TMPDIR
+ * CASES_FILE comes from store_ref.js (the web app's own state code run in node). Checks:
+ *   1. load / v1 migration / export / import parity with the web, byte for byte;
+ *   2. ECMAScript Number::toString parity;
+ *   3. a rich state built through the API survives save -> load (file shim, atomic write);
+ *   4. actions, settings, events, notes and the derived texts;
+ *   5. malformed, truncated and mutated inputs (run under ASan/UBSan by test_store.sh).
+ */
+#include "../src/store.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int g_fail = 0, g_checks = 0;
+
+static char *tdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+#define CHECK(cond, ...) do { g_checks++; if (!(cond)) { g_fail++; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); \
+    fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
+#define CHECK_STR(got, want) do { const char *g_ = (got), *w_ = (want); g_checks++; if (strcmp(g_, w_) != 0) { g_fail++; \
+    fprintf(stderr, "FAIL %s:%d:\n  got  [%s]\n  want [%s]\n", __FILE__, __LINE__, g_, w_); } } while (0)
+
+static const double NOW = 1763575445123.0;
+static const char *ISO = "2026-11-19T18:04:05.123Z";
+
+static char *unhex(const char *h, size_t *len)
+{
+    size_t n = strlen(h);
+    while (n && (h[n - 1] == '\n' || h[n - 1] == '\r')) n--;
+    char *o = malloc(n / 2 + 1);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        unsigned v;
+        sscanf(h + i, "%2x", &v);
+        o[i / 2] = (char)v;
+    }
+    o[n / 2] = 0;
+    *len = n / 2;
+    return o;
+}
+
+static char *snap(const Almanac *a, bool native)
+{
+    AlmBuf b = {0};
+    if (!alm_snapshot_json(a, native, &b)) { alm_buf_free(&b); return tdup("<oom>"); }
+    return b.data;
+}
+
+/* "seed":"..." -> "seed":"*" (for cases where both sides roll a random seed) */
+static void mask_seed(char *s)
+{
+    char *p = strstr(s, "\"seed\":\"");
+    if (!p) return;
+    p += 8;
+    char *q = strchr(p, '"');
+    if (!q) return;
+    *p = '*';
+    memmove(p + 1, q, strlen(q) + 1);
+}
+
+static void first_diff(const char *a, const char *b)
+{
+    size_t i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    size_t st = i > 60 ? i - 60 : 0;
+    fprintf(stderr, "  first difference at byte %zu\n  got  ...%.160s\n  want ...%.160s\n", i, a + st, b + st);
+}
+
+static void run_cases(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); g_fail++; return; }
+    size_t cap = 1 << 24;
+    char *line = malloc(cap), name[128] = "", mode[16] = "";
+    char *in = NULL;
+    size_t in_len = 0;
+    int ncases = 0, nnums = 0;
+    while (fgets(line, (int)cap, f)) {
+        if (strncmp(line, "CASE ", 5) == 0) {
+            sscanf(line + 5, "%127s %15s", name, mode);
+        } else if (strncmp(line, "IN ", 3) == 0) {
+            free(in);
+            in = unhex(line + 3, &in_len);
+        } else if (strncmp(line, "OUT ", 4) == 0) {
+            ncases++;
+            Almanac a;
+            CHECK(alm_init(&a, 42), "init");
+            bool not_backup = strncmp(line + 4, "NOT_BACKUP", 10) == 0;
+            size_t want_len = 0;
+            char *want = not_backup ? tdup("") : unhex(line + 4, &want_len);
+            char *got = NULL;
+            if (strcmp(mode, "import") == 0) {
+                AlmImportStatus st = alm_import_json(&a, in, in_len, NOW);
+                if (not_backup) CHECK(st == ALM_IMPORT_NOT_BACKUP, "%s: import status %d", name, (int)st);
+                else { CHECK(st == ALM_IMPORT_OK, "%s: import status %d", name, (int)st); got = snap(&a, false); }
+            } else {
+                AlmLoadStatus st = alm_load_json(&a, in, in_len);
+                if (strcmp(mode, "v1") == 0) CHECK(st == ALM_LOAD_MIGRATED_V1, "%s: status %d", name, (int)st);
+                else CHECK(st == ALM_LOAD_OK, "%s: status %d", name, (int)st);
+                if (strcmp(mode, "export") == 0) {
+                    AlmBuf b = {0};
+                    CHECK(alm_export_json(&a, ISO, &b), "export");
+                    got = b.data;
+                } else {
+                    got = snap(&a, false);
+                }
+            }
+            if (got) {
+                if (strcmp(name, "empty_obj_v2") == 0) { mask_seed(got); mask_seed(want); }
+                g_checks++;
+                if (strcmp(got, want) != 0) {
+                    g_fail++;
+                    fprintf(stderr, "FAIL case %s (%s): output differs from the web\n", name, mode);
+                    first_diff(got, want);
+                } else if (strcmp(mode, "export") != 0 && strcmp(name, "empty_obj_v2") != 0 && strcmp(name, "started_inf") != 0) {
+                    /* (started_inf: Infinity is written as null, exactly as the web does) */
+                    /* idempotence: loading our own output gives it back */
+                    Almanac b;
+                    alm_init(&b, 7);
+                    CHECK(alm_load_json(&b, got, strlen(got)) == ALM_LOAD_OK, "%s: reload", name);
+                    char *again = snap(&b, false);
+                    CHECK(strcmp(again, got) == 0, "%s: reload not idempotent", name);
+                    free(again);
+                    alm_free(&b);
+                } else if (strcmp(mode, "export") == 0) {
+                    /* export -> import round trip keeps the snapshot */
+                    Almanac b;
+                    alm_init(&b, 7);
+                    CHECK(alm_import_json(&b, got, strlen(got), NOW) == ALM_IMPORT_OK, "%s: import export", name);
+                    char *s1 = snap(&a, false), *s2 = snap(&b, false);
+                    CHECK(strcmp(s1, s2) == 0, "%s: export/import round trip", name);
+                    free(s1); free(s2);
+                    alm_free(&b);
+                }
+            }
+            free(got);
+            free(want);
+            alm_free(&a);
+        } else if (strncmp(line, "NUM ", 4) == 0) {
+            char e[64], js[64], buf[ALM_NUM_CAP];
+            if (sscanf(line + 4, "%63s %63s", e, js) == 2) {
+                nnums++;
+                double x = strtod(e, NULL);
+                alm_fmt_js_number(x, buf, sizeof buf);
+                g_checks++;
+                if (strcmp(buf, js) != 0) { g_fail++; fprintf(stderr, "FAIL number %s: got %s want %s\n", e, buf, js); }
+            }
+        }
+    }
+    free(in);
+    free(line);
+    fclose(f);
+    printf("  web parity: %d state cases, %d numbers\n", ncases, nnums);
+    CHECK(ncases > 50 && nnums > 1000, "fixture file incomplete");
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+static void test_round_trip(const char *tmpdir)
+{
+    Almanac a;
+    CHECK(alm_init(&a, 1234), "init");
+    CHECK(a.current == -1 && a.view == -1 && a.n_days == 0 && a.time == 23, "fresh state");
+    CHECK(a.seed && a.seed[0], "fresh seed");
+    CHECK(a.ui.cal_year == 1489 && a.ui.cal_month == 0, "fresh calendar");
+    free(a.seed);
+    a.seed = tdup("RIME-00FF");
+    iwd_chain_init(&a.chain, a.seed);
+    a.temp_hash = iwd_temp_hash(a.seed);
+
+    AlmResult r = alm_advance(&a, 12);
+    CHECK(!(r.fx & ALM_FX_REJECTED) && a.current == 0 && a.view == 0 && a.n_days == 1 && a.time == 12, "begin");
+    CHECK(strcmp(r.toast_lead, "The expedition begins") == 0, "lead");
+    for (int i = 0; i < 9; i++) alm_advance(&a, 12);
+    CHECK(a.current == 9 && a.n_days == 10 && a.current_abs == IWD_DEFAULT_START_ABS + 9, "advance x10");
+
+    bool upd;
+    r = alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 3, "  Yeti <attack> & co  ", ALM_EV_UNNATURAL,
+                       IWD_REPEAT_TENDAY, "  north pass  ", NOW, &upd);
+    CHECK(!upd && (r.fx & ALM_FX_SAVE) && a.n_events == 1, "event add");
+    CHECK_STR(r.toast, "<b>Yeti &lt;attack&gt; &amp; co</b> added to the almanac");
+    CHECK_STR(a.events[0].title, "Yeti <attack> & co");
+    CHECK_STR(a.events[0].details, "north pass");
+    char *id = tdup(a.events[0].id);
+    CHECK(id[0] == 'e' && strlen(id) > 5, "event id %s", id);
+    r = alm_event_save(&a, id, 0, "Yeti attack", ALM_EV_AURIL, IWD_REPEAT_YEARLY, "", NOW, &upd);
+    CHECK(upd && a.n_events == 1 && a.events[0].abs == IWD_DEFAULT_START_ABS + 3, "event update keeps anchor");
+    CHECK_STR(r.toast, "<b>Yeti attack</b> updated");
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 5, "Second \xF0\x9F\xA7\x8A", ALM_EV_REMINDER, IWD_REPEAT_NONE, NULL, NOW, &upd);
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 5, "Third", ALM_EV_NATURAL, IWD_REPEAT_NONE, "x\ny", NOW, &upd);
+    CHECK(a.n_events == 3 && strcmp(a.events[1].id, a.events[2].id) != 0, "unique ids");
+    r = alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS, " \t ", ALM_EV_NATURAL, IWD_REPEAT_NONE, NULL, NOW, &upd);
+    CHECK(r.fx & ALM_FX_REJECTED, "blank title rejected");
+    {
+        /* 'a' + 60 x U+1F9CA = 121 UTF-16 units: the cut at 120 drops the split pair whole */
+        char longt[256] = "a";
+        for (int i = 0; i < 60; i++) strcat(longt, "\xF0\x9F\xA7\x8A");
+        alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS, longt, ALM_EV_NATURAL, IWD_REPEAT_NONE, NULL, NOW, &upd);
+        CHECK(strlen(a.events[a.n_events - 1].title) == 1 + 59 * 4, "surrogate-safe cut");
+        alm_event_delete(&a, a.events[a.n_events - 1].id);
+        CHECK(a.n_events == 3, "delete by the event's own id pointer");
+    }
+
+    alm_note_set(&a, IWD_DEFAULT_START_ABS + 2, "Rumours of a \"white dragon\"\n\xE2\x9D\x84");
+    alm_note_set(&a, -77, "far past");
+    alm_note_set(&a, IWD_DEFAULT_START_ABS + 1, "temp");
+    alm_note_set(&a, IWD_DEFAULT_START_ABS + 1, "   \n ");
+    CHECK(a.notes.count == 2, "note delete on blank");
+    CHECK_STR(alm_note_get(&a, IWD_DEFAULT_START_ABS + 1), "");
+    CHECK(alm_year_name_set(&a, 1489, "  Year of the Warrior Princess  "), "yn");
+    CHECK_STR(alm_year_name(&a, 1489), "Year of the Warrior Princess");
+    alm_set_unit(&a, true);
+    a.moon_offset = 2.5;
+    a.started = NOW - 5000;
+    a.native.sound = true;
+    a.native.has_rect = true;
+    a.native.win_x = -8; a.native.win_y = 20; a.native.win_w = 1280; a.native.win_h = 760;
+    a.native.maximized = true;
+    a.native.tab = 2;
+    alm_step_day(&a, -3);
+    CHECK(a.view == 6 && a.current == 9, "step day");
+    alm_set_time(&a, 7.25, true);
+
+    char path[2100], dir[1024];
+    snprintf(dir, sizeof dir, "%s/deep/er/dir", tmpdir);
+    CHECK(alm_fs_mkdirs(dir) == ALM_IO_OK, "mkdirs");
+    CHECK(alm_fs_mkdirs(dir) == ALM_IO_OK, "mkdirs again");
+    snprintf(path, sizeof path, "%s/almanac.json", dir);
+    CHECK(alm_save_file(&a, path) == ALM_IO_OK, "save");
+    CHECK(alm_save_file(&a, path) == ALM_IO_OK, "save over existing (atomic replace)");
+    CHECK(alm_save_file_ex(&a, path, false) == ALM_IO_OK, "non-durable (debounced) save");
+    char tmpf[2200];
+    snprintf(tmpf, sizeof tmpf, "%s.tmp", path);
+    FILE *tf = fopen(tmpf, "rb");
+    CHECK(tf == NULL, "no temp file left behind");
+    if (tf) fclose(tf);
+
+    Almanac b;
+    alm_init(&b, 99);
+    CHECK(alm_load_file(&b, path) == ALM_LOAD_OK, "load");
+    char *s1 = snap(&a, true), *s2 = snap(&b, true);
+    CHECK_STR(s2, s1);
+    CHECK(b.native.sound && b.native.has_rect && b.native.win_x == -8 && b.native.win_w == 1280 && b.native.maximized &&
+          b.native.tab == 2, "native prefs");
+    CHECK(b.n_days == 10 && memcmp(a.days, b.days, sizeof(IwdDay) * 10) == 0, "days rebuilt identically");
+    CHECK(b.chain.rng_state == a.chain.rng_state, "chain state");
+    free(s1); free(s2);
+
+    /* export never carries "native"; import keeps the importer's native prefs */
+    AlmBuf ex = {0};
+    CHECK(alm_export_json(&a, ISO, &ex), "export");
+    CHECK(strstr(ex.data, "\"native\"") == NULL, "export has no native");
+    CHECK(strncmp(ex.data, "{\n  \"app\": \"icewind-dale-almanac\",\n  \"exported\": \"2026-11-19T18:04:05.123Z\",\n  \"v\": 2,", 80) == 0,
+          "export head");
+    Almanac c;
+    alm_init(&c, 5);
+    c.native.tab = 4;
+    c.busy = true;
+    CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_BUSY, "import busy");
+    c.busy = false;
+    CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_OK, "import");
+    CHECK(c.native.tab == 4 && !c.native.sound, "import keeps native prefs");
+    s1 = snap(&a, false); s2 = snap(&c, false);
+    CHECK_STR(s2, s1);
+    free(s1); free(s2);
+    char toast[ALM_TOAST_CAP];
+    alm_fmt_import_toast(&c, toast, sizeof toast);
+    CHECK_STR(toast, "Backup restored \xC2\xB7 10 days, 3 events");
+
+    char fn[128];
+    free(c.seed);
+    c.seed = tdup("A:B/C*\x01?");
+    alm_export_filename(&c, 2026, 3, 7, fn, sizeof fn);
+    CHECK_STR(fn, "icewind-almanac-A_B_C___-20260307.json");
+
+    /* missing / unreadable files */
+    char missing[1100];
+    snprintf(missing, sizeof missing, "%s/nope.json", tmpdir);
+    CHECK(alm_load_file(&c, missing) == ALM_LOAD_NO_FILE && c.n_days == 0 && c.current == -1, "no file");
+    CHECK(alm_import_file(&c, missing, NOW) == ALM_IMPORT_READ_ERROR, "import missing");
+    snprintf(missing, sizeof missing, "%s/no/such/dir/x.json", tmpdir);
+    CHECK(alm_fs_write_atomic(missing, "{}", 2) == ALM_IO_ERROR, "write into a missing directory fails");
+    CHECK(alm_import_file(&c, path, NOW) == ALM_IMPORT_OK && c.n_days == 10, "import save file");
+
+    alm_buf_free(&ex);
+    free(id);
+    alm_free(&a);
+    alm_free(&b);
+    alm_free(&c);
+}
+
+static Almanac fresh(const char *seed, int days)
+{
+    Almanac a;
+    alm_init(&a, 77);
+    char json[256];
+    snprintf(json, sizeof json, "{\"v\":2,\"seed\":\"%s\",\"dayCount\":%d}", seed, days);
+    alm_load_json(&a, json, strlen(json));
+    return a;
+}
+
+static void test_actions(void)
+{
+    char buf[512];
+    Almanac a = fresh("RIME-00FF", 0);
+    AlmHero h;
+    AlmControls ct;
+    alm_hero(&a, &h);
+    CHECK_STR(h.date, "1 Hammer 1489 DR");
+    CHECK_STR(h.tag, "Expedition start");
+    CHECK_STR(h.day_label, "Before the First Dawn");
+    alm_controls(&a, &ct);
+    CHECK_STR(ct.main, "Begin the Expedition");
+    CHECK_STR(ct.sub, "d12 opens 1 Hammer 1489 DR");
+    CHECK_STR(ct.day_nav, "No days yet");
+    CHECK(alm_fmt_announce(&a, buf, sizeof buf) == 0, "no announce in the intro");
+    CHECK(alm_step_hour(&a, 1).fx & ALM_FX_REJECTED, "no hour step in the intro");
+    CHECK(alm_toggle_play(&a).fx & ALM_FX_REJECTED, "no play in the intro");
+
+    AlmResult r = alm_advance(&a, 12);
+    CHECK(a.current == 0 && a.time == 12, "begin");
+    alm_controls(&a, &ct);
+    CHECK_STR(ct.main, "Advance to 2 Hammer");
+    CHECK(strstr(ct.sub, "carries on \xC2\xB7 ") || strstr(ct.sub, "rolls in at midnight"), "sub %s", ct.sub);
+    CHECK_STR(ct.day_nav, "1 Hammer \xC2\xB7 Day 1");
+    alm_hero(&a, &h);
+    CHECK_STR(h.tag, "Today");
+    CHECK_STR(h.day_label, "Day 1 of the expedition");
+    alm_fmt_announce(&a, buf, sizeof buf);
+    CHECK(strncmp(buf, "1 Hammer 1489 DR, day 1, 12:00: ", 32) == 0, "announce %s", buf);
+
+    /* hour stepping */
+    r = alm_step_hour(&a, 1);
+    CHECK(a.time == 13 && (r.fx & ALM_FX_SAVE) && (r.fx & ALM_FX_ANNOUNCE), "hour +1");
+    alm_set_time(&a, 23.4, true);
+    r = alm_step_hour(&a, 1);
+    CHECK(a.current == 1 && a.view == 1 && a.time == 0 && a.n_days == 2, "23:00 + 1 on today advances, lands 00:00");
+    CHECK(strcmp(r.toast_lead, "Today") == 0, "lead today");
+    r = alm_step_hour(&a, -1);
+    CHECK(a.view == 0 && a.time == 23 && a.current == 1, "00:00 - 1 goes to the previous day 23:00");
+    r = alm_step_hour(&a, 1);
+    CHECK(a.view == 1 && a.time == 0 && a.current == 1 && a.n_days == 2, "23:00 + 1 on a past day moves on");
+    alm_step_day(&a, -1);
+    CHECK(a.view == 0, "step day back");
+    alm_set_time(&a, 0.5, true);
+    r = alm_step_hour(&a, -1);
+    CHECK((r.fx & ALM_FX_REJECTED) && a.view == 0, "no hour before day 1");
+
+    /* playback */
+    alm_set_time(&a, 23.95, true);
+    r = alm_toggle_play(&a);
+    CHECK(a.playing && a.time == 0, "play restarts a finished day");
+    r = alm_play_tick(&a, 18.8);
+    r = alm_toggle_play(&a);
+    CHECK(!a.playing && a.time == 18 && (r.fx & ALM_FX_SAVE), "pause settles on the whole hour (%g)", a.time);
+    r = alm_toggle_play(&a);
+    CHECK(a.playing && a.time == 18, "resume from the whole hour");
+    r = alm_play_tick(&a, 6);
+    CHECK(a.view == 1 && a.time < 1 && a.playing, "play into the next recorded day");
+    r = alm_play_tick(&a, 24);
+    CHECK(!a.playing && a.time == 23.99 && (r.fx & ALM_FX_BECKON) && a.view == 1, "stops at the end of today");
+
+    /* select / set current */
+    r = alm_select(&a, IWD_DEFAULT_START_ABS + 5, true);
+    CHECK(a.view == 5 && a.n_days == 6 && a.current == 1 && a.sel_abs == IWD_DEFAULT_START_ABS + 5, "select rolls ahead");
+    alm_hero(&a, &h);
+    CHECK_STR(h.tag, "In 4 days");
+    CHECK(h.tag_kind == ALM_TAG_AHEAD, "ahead");
+    r = alm_select(&a, IWD_DEFAULT_START_ABS + 4000, false);
+    CHECK_STR(r.toast, "Beyond the almanac: at most 3650 days of weather can be recorded.");
+    CHECK(a.view == 5 && a.sel_abs == IWD_DEFAULT_START_ABS + 4000, "beyond keeps the view");
+    AlmDayPanel dp;
+    alm_day_panel(&a, &dp);
+    CHECK_STR(dp.weather_none, "Beyond the almanac: at most 3650 days can be recorded.");
+    CHECK(!dp.show_set_current, "no set current beyond");
+    r = alm_set_current(&a, IWD_DEFAULT_START_ABS - 1);
+    CHECK_STR(r.toast, "The expedition begins on <b>1 Hammer 1489 DR</b>. Change the start date in Settings to begin earlier.");
+    r = alm_set_current(&a, IWD_DEFAULT_START_ABS + 3);
+    CHECK(a.current == 3 && a.view == 3 && strcmp(r.toast_lead, "Today is now") == 0, "set current");
+    CHECK((r.fx & ALM_FX_DAY_TOAST) || strcmp(r.toast, "Today is now <b>4 Hammer 1489 DR</b>") == 0, "set current toast %s", r.toast);
+    alm_day_panel(&a, &dp);
+    CHECK_STR(dp.eyebrow, "Today \xC2\xB7 Day 4 of the expedition");
+    CHECK_STR(dp.set_current_label, "This is the current day");
+    CHECK(dp.weather && dp.wx_seq[0] && strncmp(dp.wx_cold, "DC ", 3) == 0, "day weather");
+    alm_select(&a, IWD_DEFAULT_START_ABS + 1, false);
+    alm_day_panel(&a, &dp);
+    CHECK_STR(dp.eyebrow, "Day 2 of the expedition \xC2\xB7 2 days ago");
+    CHECK_STR(dp.sub, "Hammer \xE2\x80\x94 Deepwinter \xC2\xB7 First tenday, day 2");
+    CHECK(strncmp(dp.moon_name, "Sel\xC3\xBBne \xC2\xB7 ", 10) == 0, "moon name");
+
+    /* festival day panel + year name */
+    alm_year_name_set(&a, 1489, "Year of the Warrior Princess");
+    alm_select(&a, IWD_DEFAULT_START_ABS + 30, false);   /* Midwinter */
+    alm_day_panel(&a, &dp);
+    CHECK_STR(dp.date, "Midwinter, 1489 DR");
+    CHECK_STR(dp.sub, "Festival day \xC2\xB7 after Hammer \xC2\xB7 Year of the Warrior Princess");
+    CHECK(a.ui.cal_year == 1489 && a.ui.cal_month == 0, "festival shown in its month");
+    AlmCell cells[32];
+    int nc = alm_month_cells(&a, cells);
+    CHECK(nc == 31 && cells[30].is_festival && strcmp(cells[30].festival_name, "Midwinter") == 0, "cells %d", nc);
+    CHECK(cells[0].is_start && strcmp(cells[0].tag, "Start") == 0 && cells[3].is_today && strcmp(cells[3].tag, "Today") == 0,
+          "cell tags");
+    CHECK(cells[30].is_sel && cells[0].has_weather && cells[29].has_weather && a.n_days == 31, "cell states (select rolled up to the festival)");
+    alm_fmt_cell_label(&a, &cells[30], buf, sizeof buf);
+    CHECK(strncmp(buf, "Midwinter, 1489 DR \xC2\xB7 ", 21) == 0 && strstr(buf, ", festival"), "label %s", buf);
+
+    /* calendar paging */
+    for (int i = 0; i < 12; i++) alm_cal_step(&a, 1);
+    CHECK(a.ui.cal_year == 1490 && a.ui.cal_month == 0, "page a year");
+    alm_cal_step(&a, -1);
+    CHECK(a.ui.cal_year == 1489 && a.ui.cal_month == 11, "page back");
+    alm_cal_today(&a);
+    CHECK(a.sel_abs == IWD_DEFAULT_START_ABS + 3 && a.ui.cal_month == 0, "today button");
+
+    /* events on days, marks, upcoming, meta */
+    bool upd;
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 3, "Reminder late", ALM_EV_REMINDER, IWD_REPEAT_NONE, "", NOW, &upd);
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 3, "Auril late", ALM_EV_AURIL, IWD_REPEAT_NONE, "", NOW + 1, &upd);
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS, "Auril early", ALM_EV_AURIL, IWD_REPEAT_TENDAY, "", NOW + 2, &upd);
+    const AlmEvent *evs[8];
+    int ne = alm_events_on(&a, IWD_DEFAULT_START_ABS + 10, evs, 8);
+    CHECK(ne == 1 && strcmp(evs[0]->title, "Auril early") == 0, "tenday repeat");
+    ne = alm_events_on(&a, IWD_DEFAULT_START_ABS + 3, evs, 8);
+    CHECK(ne == 2 && strcmp(evs[0]->title, "Auril late") == 0 && strcmp(evs[1]->title, "Reminder late") == 0, "priority sort");
+    AlmMark mk[8];
+    int nm = alm_marks_on(&a, IWD_DEFAULT_START_ABS + 10, mk, 8);
+    alm_fmt_mark_meta(&mk[nm - 1], IWD_DEFAULT_START_ABS + 10, buf, sizeof buf);
+    CHECK_STR(buf, "Auril \xC2\xB7 Every tenday \xC2\xB7 since 1 Hammer 1489");
+    nm = alm_marks_on(&a, IWD_DEFAULT_START_ABS + 3, mk, 8);
+    alm_fmt_mark_meta(&mk[nm - 1], IWD_DEFAULT_START_ABS + 3, buf, sizeof buf);
+    CHECK_STR(buf, "Reminder \xC2\xB7 One-time");
+    AlmUpcoming up[ALM_UPCOMING_DAYS + 1];
+    int nu = alm_upcoming(&a, up);
+    CHECK(nu >= 2 && up[0].abs == IWD_DEFAULT_START_ABS + 3 && up[0].rel_days == 0, "upcoming");
+    /* a new moon day carries the built-in mark first */
+    int32_t nmd = 0;
+    for (int32_t d = IWD_DEFAULT_START_ABS; d < IWD_DEFAULT_START_ABS + 40; d++)
+        if (iwd_moon(d, a.moon_offset).is_new) { nmd = d; break; }
+    CHECK(nmd != 0, "new moon found");
+    nm = alm_marks_on(&a, nmd, mk, 8);
+    CHECK(nm >= 1 && mk[0].builtin && strcmp(mk[0].chip, "Sacrifice to Auril") == 0, "builtin first");
+    char title[128];
+    int nt = 0;
+    CHECK(alm_day_toast(&a, nmd, "Today", title, sizeof title, mk, 8, &nt) && nt == nm, "day toast");
+    r = alm_event_delete(&a, evs[0]->id);
+    CHECK_STR(r.toast, "<b>Auril late</b> removed");
+
+    /* settings */
+    AlmSettingsForm f;
+    alm_settings_fill(&a, &f);
+    CHECK(f.start_year == 1489 && f.start_option == 0 && f.start_day == 1 && strcmp(f.seed, "RIME-00FF") == 0, "fill");
+    CHECK_STR(f.yn_name, "Year of the Warrior Princess");
+    f.start_year_valid = false;
+    AlmApplyResult ar = alm_settings_apply(&a, &f, false);
+    CHECK(ar.status == ALM_APPLY_DATE_ERROR, "no year");
+    CHECK_STR(ar.message, "Enter a year.");
+    f.start_year_valid = true;
+    f.start_day = 31;
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK_STR(ar.message, "Months have 30 days: pick a day from 1 to 30.");
+    f.start_day = 1;
+    f.start_option = alm_start_option_index(-1, IWD_FEST_SHIELDMEET);
+    CHECK(f.start_option == 10, "shieldmeet option");
+    f.start_year = 1489;
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK_STR(ar.message, "Shieldmeet only falls in leap years; 1489 DR is not one.");
+    f.start_option = 0;
+    f.start_day = 2;
+    snprintf(f.seed, sizeof f.seed, "  frost-<1>  ");
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK(ar.status == ALM_APPLY_NEEDS_CONFIRM, "confirm");
+    CHECK_STR(ar.message, "<b>Regenerate the weather?</b> All recorded weather is replaced and rolled again from "
+                          "<b>2 Hammer 1489 DR</b> with seed <code>FROST-&lt;1&gt;</code>, up to the party's current day, "
+                          "<b>4 Hammer 1489 DR</b>. Notes and events are kept.");
+    CHECK(strcmp(a.seed, "RIME-00FF") == 0, "nothing applied before the confirm");
+    f.now_ms = NOW;
+    f.celsius = true;
+    f.moon_offset = 99;
+    snprintf(f.yn_name, sizeof f.yn_name, "  ");
+    ar = alm_settings_apply(&a, &f, true);
+    CHECK(ar.status == ALM_APPLY_DONE, "apply");
+    CHECK_STR(ar.result.toast, "Weather regenerated from <b>2 Hammer 1489 DR</b> \xC2\xB7 seed FROST-&lt;1&gt;");
+    CHECK(strcmp(a.seed, "FROST-<1>") == 0 && a.start_abs == IWD_DEFAULT_START_ABS + 1 && a.current == 2 &&
+          a.n_days == 3 && a.current_abs == IWD_DEFAULT_START_ABS + 3 && a.started == NOW, "regenerated");
+    CHECK(a.celsius && a.moon_offset == 30 && alm_map_get(&a.year_names, 1489) == NULL, "settings applied");
+    CHECK(a.n_events == 2 && a.notes.count == 0, "events kept");
+    /* new start after today: expedition not begun, currentAbs kept */
+    alm_settings_fill(&a, &f);
+    f.start_day = 20;
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK(strstr(ar.message, "The party's current day falls before the new start, so the expedition will begin on "
+                             "<b>20 Hammer 1489 DR</b>.") != NULL, "confirm before %s", ar.message);
+    ar = alm_settings_apply(&a, &f, true);
+    CHECK(a.current == -1 && a.view == -1 && a.n_days == 0 && a.time == 23 && a.has_current_abs &&
+          a.current_abs == IWD_DEFAULT_START_ABS + 3 && a.sel_abs == IWD_DEFAULT_START_ABS + 19, "re-roll after today");
+    /* no days -> no confirmation */
+    alm_settings_fill(&a, &f);
+    snprintf(f.seed, sizeof f.seed, "sleet-0001");
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK(ar.status == ALM_APPLY_DONE && strcmp(a.seed, "SLEET-0001") == 0, "no confirm without days");
+    snprintf(f.seed, sizeof f.seed, "   ");
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK(ar.status == ALM_APPLY_DONE && strlen(a.seed) >= 8 && strchr(a.seed, '-'), "random seed %s", a.seed);
+
+    char up8[64];
+    alm_normalize_seed("  \xC3\xA9t\xC3\xA9 \xC3\x9F \xCF\x83 \xD0\xB6 \xC4\x87 ", up8, sizeof up8);
+    CHECK_STR(up8, "\xC3\x89T\xC3\x89 SS \xCE\xA3 \xD0\x96 \xC4\x86");
+    /* full case mapping like the web's toUpperCase(): expansions and digraphs */
+    alm_normalize_seed("stra\xC3\x9F" "e \xEF\xAC\x81re \xC7\x86" "emal \xC5\x89", up8, sizeof up8);
+    CHECK_STR(up8, "STRASSE FIRE \xC7\x84" "EMAL \xCA\xBCN");
+    snprintf(f.seed, sizeof f.seed, " stra\xC3\x9F" "e ");
+    ar = alm_settings_apply(&a, &f, false);
+    CHECK(ar.status == ALM_APPLY_DONE && strcmp(a.seed, "STRASSE") == 0, "seed straße -> %s", a.seed);
+    {   /* 40 x U+0390 (80 bytes) triples to 240 bytes and must not be cut */
+        char big[4 * ALM_SEED_INPUT_MAX + 1] = "";
+        for (int i = 0; i < 40; i++) strcat(big, "\xCE\x90");
+        snprintf(f.seed, sizeof f.seed, "%s", big);
+        ar = alm_settings_apply(&a, &f, false);
+        CHECK(ar.status == ALM_APPLY_DONE && strlen(a.seed) == 240, "tripled seed kept whole (%zu)", strlen(a.seed));
+    }
+
+    /* the almanac fills up */
+    Almanac full = fresh("FULL", 3650);
+    CHECK(full.current == 3649, "full");
+    alm_controls(&full, &ct);
+    CHECK_STR(ct.main, "The Almanac Is Full");
+    CHECK(!ct.advance_enabled && !ct.next_enabled, "full controls");
+    CHECK(alm_advance(&full, 12).fx & ALM_FX_REJECTED, "cannot advance a full almanac");
+    alm_set_time(&full, 23, true);
+    CHECK(alm_step_hour(&full, 1).fx & ALM_FX_REJECTED, "no hour past the last day");
+    alm_free(&full);
+
+    alm_free(&a);
+}
+
+/* ---------------------------------------------------------------------------------- */
+
+static uint64_t rs = 0x1234567;
+static uint32_t rnd(void) { rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; return (uint32_t)rs; }
+
+static void check_valid(const Almanac *a, const char *what)
+{
+    bool ok = a->seed && a->seed[0] && a->n_days >= 0 && a->n_days <= IWD_MAX_DAYS && a->current >= -1 &&
+              a->current < a->n_days && a->view >= -1 && a->view < a->n_days && a->time >= 0 && a->time < 24 &&
+              a->ui.cal_month >= 0 && a->ui.cal_month < 12 && a->moon_offset >= -30 && a->moon_offset <= 30;
+    for (int i = 0; ok && i < a->n_events; i++)
+        ok = a->events[i].id && a->events[i].id[0] && a->events[i].title && a->events[i].title[0] && a->events[i].details;
+    g_checks++;
+    if (!ok) { g_fail++; fprintf(stderr, "FAIL invalid state after %s\n", what); }
+}
+
+static void exercise(Almanac *a)
+{
+    /* every derived view must be safe on any loaded state */
+    char buf[1024];
+    AlmHero h; AlmControls c; AlmDayPanel d; AlmCell cells[32]; AlmUpcoming up[ALM_UPCOMING_DAYS + 1];
+    alm_hero(a, &h);
+    alm_controls(a, &c);
+    alm_day_panel(a, &d);
+    int n = alm_month_cells(a, cells);
+    for (int i = 0; i < n; i++) alm_fmt_cell_label(a, &cells[i], buf, sizeof buf);
+    alm_upcoming(a, up);
+    alm_fmt_announce(a, buf, sizeof buf);
+    AlmBuf b = {0};
+    alm_snapshot_json(a, true, &b);
+    Almanac x;
+    alm_init(&x, 3);
+    alm_load_json(&x, b.data, b.len);
+    AlmBuf b2 = {0};
+    alm_snapshot_json(&x, true, &b2);
+    g_checks++;
+    if (strcmp(b.data, b2.data) != 0) { g_fail++; fprintf(stderr, "FAIL fuzz: save/load not stable\n"); first_diff(b2.data, b.data); }
+    alm_buf_free(&b);
+    alm_buf_free(&b2);
+    alm_free(&x);
+}
+
+static void test_malformed(void)
+{
+    static const char *bad[] = {
+        "", " ", "{", "}", "[", "{\"v\":2,", "{\"v\":2,\"seed\":\"x\"", "{\"v\":2 \"seed\":1}", "{\"v\":2,}",
+        "{'v':2}", "{\"v\":2,\"seed\":\"a\nb\"}", "{\"v\":2,\"seed\":\"\\x\"}", "{\"v\":2,\"seed\":\"\\u12\"}",
+        "{\"v\":01}", "{\"v\":-}", "{\"v\":1.}", "{\"v\":.5}", "{\"v\":1e}", "{\"v\":+1}", "{\"v\":NaN}",
+        "{\"v\":Infinity}", "{\"v\":tru}", "{\"v\":nul}", "{\"v\":2}x", "{\"v\":2}{}", "null", "true", "5", "\"str\"",
+        "[]", "[{\"v\":2,\"seed\":\"A\"}]", "\xEF\xBB\xBF", "\xFF\xFE", "{\"v\":2,\"seed\":\"x\"}\x00",
+        "{\"a\":[1,2,]}", "{\"a\":[,1]}", "{\"a\" 1}", "{1:2}", "{\"v\":2,\"seed\":\"\x01\"}",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        Almanac a;
+        alm_init(&a, i);
+        size_t len = strlen(bad[i]);
+        if (i == sizeof bad / sizeof bad[0] - 6) len++;   /* the trailing NUL case */
+        AlmLoadStatus st = alm_load_json(&a, bad[i], len);
+        CHECK(st == ALM_LOAD_CORRUPT, "bad[%zu] status %d", i, (int)st);
+        check_valid(&a, "bad json");
+        CHECK(alm_import_json(&a, bad[i], len, NOW) == ALM_IMPORT_NOT_BACKUP, "bad[%zu] import", i);
+        alm_free(&a);
+    }
+    /* deep nesting: rejected (or accepted when shallow enough), never a crash */
+    for (int depth = 200; depth <= 200000; depth *= 10) {
+        size_t n = (size_t)depth * 2 + 64;
+        char *s = malloc(n);
+        size_t k = (size_t)snprintf(s, n, "{\"v\":2,\"seed\":\"D\",\"x\":");
+        for (int i = 0; i < depth; i++) s[k++] = '[';
+        for (int i = 0; i < depth; i++) s[k++] = ']';
+        s[k++] = '}';
+        Almanac a;
+        alm_init(&a, 1);
+        AlmLoadStatus st = alm_load_json(&a, s, k);
+        CHECK(depth <= 250 ? st == ALM_LOAD_OK : st == ALM_LOAD_CORRUPT, "depth %d status %d", depth, (int)st);
+        check_valid(&a, "deep");
+        alm_free(&a);
+        free(s);
+    }
+    /* huge note is capped, long seed kept */
+    {
+        size_t n = 600000;
+        char *s = malloc(n + 200);
+        size_t k = (size_t)snprintf(s, 200, "{\"v\":2,\"seed\":\"");
+        for (size_t i = 0; i < 300; i++) s[k++] = 'S';
+        k += (size_t)snprintf(s + k, 200, "\",\"notes\":{\"5\":\"");
+        for (size_t i = 0; i < 400000; i++) s[k++] = (i % 3) ? 'a' : 'b';
+        k += (size_t)snprintf(s + k, 40, "\"}}");
+        Almanac a;
+        alm_init(&a, 1);
+        CHECK(alm_load_json(&a, s, k) == ALM_LOAD_OK, "huge");
+        CHECK(strlen(alm_note_get(&a, 5)) == ALM_MAX_NOTE_BYTES && strlen(a.seed) == 300, "caps");
+        alm_free(&a);
+        free(s);
+    }
+    /* UTF-16 LE file with BOM */
+    {
+        const char *t = "{\"v\":2,\"seed\":\"W\xC3\xA9\"}";
+        unsigned char u[128];
+        size_t k = 0;
+        u[k++] = 0xFF; u[k++] = 0xFE;
+        for (const char *p = "{\"v\":2,\"seed\":\"W"; *p; p++) { u[k++] = (unsigned char)*p; u[k++] = 0; }
+        u[k++] = 0xE9; u[k++] = 0;
+        u[k++] = '"'; u[k++] = 0; u[k++] = '}'; u[k++] = 0;
+        Almanac a;
+        alm_init(&a, 1);
+        CHECK(alm_load_json(&a, (const char *)u, k) == ALM_LOAD_OK && strcmp(a.seed, "W\xC3\xA9") == 0, "utf16 %s", t);
+        alm_free(&a);
+    }
+}
+
+static void test_fuzz(const char *cases_path)
+{
+    /* base documents: a rich state through the API, its export, and a fixture */
+    Almanac a = fresh("FUZZ-0001", 12);
+    bool upd;
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 2, "T\xF0\x9F\xA7\x8A \"q\"", ALM_EV_AURIL, IWD_REPEAT_NEWMOON, "d\n", NOW, &upd);
+    alm_event_save(&a, NULL, IWD_DEFAULT_START_ABS + 4, "Yearly", ALM_EV_NATURAL, IWD_REPEAT_YEARLY, "", NOW, &upd);
+    alm_note_set(&a, IWD_DEFAULT_START_ABS + 3, "note \\ \x01 \xE2\x80\xA8");
+    alm_note_set(&a, -9, "neg");
+    alm_year_name_set(&a, 1489, "Year");
+    AlmBuf docs[3] = { {0}, {0}, {0} };
+    alm_snapshot_json(&a, true, &docs[0]);
+    alm_export_json(&a, ISO, &docs[1]);
+    {
+        AlmBuf f = {0};
+        if (alm_fs_read(cases_path, &f) == ALM_IO_OK) {
+            const char *p = strstr(f.data, "CASE rich v2\nIN ");
+            if (p) {
+                p += 16;
+                const char *e = strchr(p, '\n');
+                char *h = malloc((size_t)(e - p) + 1);
+                memcpy(h, p, (size_t)(e - p));
+                h[e - p] = 0;
+                size_t len;
+                char *raw = unhex(h, &len);
+                docs[2].data = raw; docs[2].len = len; docs[2].cap = len + 1;
+                free(h);
+            }
+        }
+        alm_buf_free(&f);
+    }
+    alm_free(&a);
+    int runs = 0;
+    for (int d = 0; d < 3; d++) {
+        if (!docs[d].data) continue;
+        size_t n = docs[d].len;
+        /* every truncation */
+        for (size_t cut = 0; cut <= n; cut += (n > 4000 ? 3 : 1)) {
+            char *t = malloc(cut + 1);
+            memcpy(t, docs[d].data, cut);
+            t[cut] = 0;
+            Almanac x;
+            alm_init(&x, cut);
+            alm_load_json(&x, t, cut);
+            check_valid(&x, "truncation");
+            if (cut % 97 == 0) exercise(&x);
+            alm_import_json(&x, t, cut, NOW);
+            check_valid(&x, "truncated import");
+            alm_free(&x);
+            free(t);
+            runs++;
+        }
+        /* random mutations */
+        static const char pool[] = "{}[],:\"\\0123456789-+.eEtrufalsn \x80\xC3\xED\xF0\xFF";
+        for (int it = 0; it < 3000; it++) {
+            char *t = malloc(n + 16);
+            memcpy(t, docs[d].data, n);
+            size_t len = n;
+            int muts = 1 + (int)(rnd() % 6);
+            for (int m = 0; m < muts; m++) {
+                size_t pos = len ? rnd() % len : 0;
+                switch (rnd() % 3) {
+                case 0: t[pos] = pool[rnd() % (sizeof pool - 1)]; break;
+                case 1: if (len) { memmove(t + pos, t + pos + 1, len - pos - 1); len--; } break;
+                default: if (len < n + 15) { memmove(t + pos + 1, t + pos, len - pos); t[pos] = pool[rnd() % (sizeof pool - 1)]; len++; } break;
+                }
+            }
+            Almanac x;
+            alm_init(&x, (uint64_t)it);
+            AlmLoadStatus st = alm_load_json(&x, t, len);
+            check_valid(&x, "mutation");
+            if (st == ALM_LOAD_OK && it % 7 == 0) {
+                exercise(&x);
+                alm_step_hour(&x, 1);
+                alm_advance(&x, 12);
+                alm_step_hour(&x, -1);
+                check_valid(&x, "actions after mutation");
+            }
+            alm_free(&x);
+            free(t);
+            runs++;
+        }
+    }
+    for (int d = 0; d < 3; d++) alm_buf_free(&docs[d]);
+    printf("  fuzz: %d documents\n", runs);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) { fprintf(stderr, "usage: test_store CASES_FILE TMPDIR\n"); return 2; }
+    run_cases(argv[1]);
+    test_round_trip(argv[2]);
+    test_actions();
+    test_malformed();
+    test_fuzz(argv[1]);
+    if (g_fail) { fprintf(stderr, "store tests: %d of %d checks FAILED\n", g_fail, g_checks); return 1; }
+    printf("store tests: OK (%d checks)\n", g_checks);
+    return 0;
+}

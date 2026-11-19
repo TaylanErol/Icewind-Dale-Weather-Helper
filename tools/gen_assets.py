@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerates native/assets/w01.jpg .. w12.jpg (720x240 weather scene images).
+"""Regenerates native/assets/w01.jpg .. w12.jpg (1200x400 weather scene images).
 
 Dependencies: numpy + Pillow only (no scipy).
 Deterministic: every random stream is seeded with a fixed constant.
@@ -10,7 +10,12 @@ into a G-buffer, and every weather event gets one of those views plus its own
 sky, cloud deck, lighting, haze and particle effects.  Rendering happens in linear light at 2x supersampling and is
 box-filtered down, tone-mapped, grained and saved as baseline JPEG.
 
-Usage:  python3 tools/gen_assets.py [event ids ...]
+The scenes were composed at 720x240.  Every length measured in pixels is
+written in those 720-wide units and multiplied by K (= output width / 720), so
+any output width renders the same picture, only sharper; --width 720
+reproduces the original 720x240 files byte for byte.
+
+Usage:  python3 tools/gen_assets.py [--width N] [event ids ...]
 """
 import io
 import math
@@ -20,14 +25,36 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw
 
-W0, H0, S = 720, 240, 2
+
+def _width_arg():
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a == "--width":
+            return int(sys.argv[i + 1])
+        if a.startswith("--width="):
+            return int(a.split("=", 1)[1])
+    return 1200
+
+
+W0 = _width_arg()
+H0, S = W0 // 3, 2
 W, H = W0 * S, H0 * S
+K = W0 / 720.0                  # pixel lengths below are in 720-wide units
+
+
+def px(v):
+    """A pixel length from the 720x240 composition, at the output resolution."""
+    return v * K
+
+
+def ipx(v):
+    return int(round(v * K))
+
 HOR = int(H * 0.675)            # horizon row (supersampled); set per view
 FOCAL = W * 1.15                # set per view
 F32 = np.float32
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "native", "assets")
-MAX_BYTES = 58000
+MAX_BYTES = 58000 if W0 <= 720 else 100000    # 12 x 100 KB stays under 1.2 MB
 
 YY, XX = np.mgrid[0:H, 0:W].astype(F32)
 YY += 0.5
@@ -83,17 +110,31 @@ def bil(tex, x, y):
     y0 = np.floor(y)
     fx = (x - x0).astype(F32)
     fy = (y - y0).astype(F32)
-    x0 = x0.astype(np.intp) % w
-    y0 = y0.astype(np.intp) % h
-    x1 = (x0 + 1) % w
-    y1 = (y0 + 1) % h
-    a = tex[y0, x0]
-    b = tex[y0, x1]
-    c = tex[y1, x0]
-    d = tex[y1, x1]
-    top = a + (b - a) * fx
-    bot = c + (d - c) * fx
-    return top + (bot - top) * fy
+    xi = x0.astype(np.intp)
+    xi %= w
+    yi = y0.astype(np.intp)
+    yi %= h
+    del x0, y0
+    x1 = xi + 1
+    x1[x1 == w] = 0
+    yi *= w                                    # flat row offsets
+    y1 = yi + w
+    y1[y1 == h * w] = 0
+    t = tex.ravel()
+    top = t.take(yi + x1)
+    a = t.take(yi + xi)
+    top -= a
+    top *= fx
+    top += a
+    bot = t.take(y1 + x1)
+    c = t.take(y1 + xi)
+    bot -= c
+    bot *= fx
+    bot += c
+    bot -= top
+    bot *= fy
+    bot += top
+    return bot
 
 
 def bilc(tex, x, y):
@@ -303,8 +344,8 @@ def build_gbuffer(V):
     z = zs[ip] + t * (zs[idx] - zs[ip])
     cov = np.clip(np.arange(H)[:, None] + 1.0 - skyline[None, :], 0, 1).astype(F32)
     # put the moon over the most open stretch of skyline right of centre
-    cand = np.arange(int(V["moon"][0] * W), int(V["moon"][1] * W), 8)
-    moon_x = float(cand[np.argmax([skyline[c - 60:c + 60].min() for c in cand])])
+    cand = np.arange(int(V["moon"][0] * W), int(V["moon"][1] * W), ipx(8))
+    moon_x = float(cand[np.argmax([skyline[c - ipx(60):c + ipx(60)].min() for c in cand])])
     pmx = (CAMX + z * cols[None, :]).astype(F32)
     pmy = (CAMY + z).astype(F32)
     g = {
@@ -365,7 +406,7 @@ def stars_layer(rng, count=1500):
     for i, k in enumerate((0.16, 0.02, -0.18)):
         ch = np.zeros((H, W), F32)
         splat(ch, x, y, mag * (1.0 + k * tc))
-        out[..., i] = gblur(ch, 0.7) * 4.5 + gblur(ch * (ch > 0.25), 2.4) * 5.0
+        out[..., i] = (gblur(ch, px(0.7)) * 4.5 + gblur(ch * (ch > 0.25), px(2.4)) * 5.0) * K * K
     band = np.exp(-((YY - (0.05 * H + 0.42 * (XX - 0.1 * W))) / (0.13 * H)) ** 2)
     mw = band * np.clip(0.55 + 0.5 * fbm(XX / W * 0.9, YY / W * 0.9, 6, 0.62, 51), 0, None)
     out += mw[..., None] * srgb(24, 28, 42)[None, None, :]
@@ -375,10 +416,10 @@ def stars_layer(rng, count=1500):
 
 
 def moon_layer(rng):
-    r = 15.0
+    r = px(15.0)
     d = np.hypot(XX - MOON_X, YY - MOON_Y)
-    disc = smooth(r + 1.0, r - 1.0, d)
-    mare = fbm((XX - MOON_X) / 70.0, (YY - MOON_Y) / 70.0, 5, 0.6, 61)
+    disc = smooth(r + px(1.0), r - px(1.0), d)
+    mare = fbm((XX - MOON_X) / px(70.0), (YY - MOON_Y) / px(70.0), 5, 0.6, 61)
     limb = np.sqrt(np.clip(1.0 - (d / r) ** 2, 0, 1))
     tex = (0.80 + 0.20 * limb) * (1.0 - 0.33 * smooth(-0.2, 0.9, mare))
     glow = 0.30 * np.exp(-d / (0.035 * W)) + 0.10 * np.exp(-d / (0.12 * W)) + \
@@ -411,14 +452,14 @@ def aurora_layer(rng, curtains):
         IMP = np.fft.rfft(imp, axis=0)
         Lg = lg * H
         kg = np.exp(-d / Lg) + 0.7 * np.exp(-d / (Lg * 3.2))
-        kg[1:] += np.exp(-((hh - d[1:]) / 2.2) ** 2) + 0.45 * np.exp(-(hh - d[1:]) / (Lg * 0.45))
+        kg[1:] += np.exp(-((hh - d[1:]) / px(2.2)) ** 2) + 0.45 * np.exp(-(hh - d[1:]) / (Lg * 0.45))
         kp = (d / (Lg * 1.3)) ** 1.5 * np.exp(-d / (Lg * 1.5))
         g = np.fft.irfft(IMP * np.conj(np.fft.rfft(kg))[:, None], n=hh, axis=0)
         p = np.fft.irfft(IMP * np.conj(np.fft.rfft(kp))[:, None], n=hh, axis=0)
         g = g[H // 2:H // 2 + H].astype(F32)
         p = p[H // 2:H // 2 + H].astype(F32)
-        g = gblur(g, 3.5) * 0.62 + gblur(g, 10.0) * 0.42 + gblur(g, 34.0) * 0.22
-        p = gblur(p, 4.0) * 0.5 + gblur(p, 16.0) * 0.6
+        g = gblur(g, px(3.5)) * 0.62 + gblur(g, px(10.0)) * 0.42 + gblur(g, px(34.0)) * 0.22
+        p = gblur(p, px(4.0)) * 0.5 + gblur(p, px(16.0)) * 0.6
         out += g[..., None] * np.array([0.07, 0.95, 0.40], F32) + \
             p[..., None] * np.array([0.30, 0.16, 0.62], F32) * 0.55
     return out
@@ -437,7 +478,7 @@ def cloud_density(seed, thr, soft, sx=1.0, sy=1.0, warp=0.25, octaves=7, gain=0.
         X = cx + dx * ca - dy * sa
         Y = cy + (dx * sa + dy * ca) / 2.2
     yh = HOR + 0.10 * H
-    dy = np.maximum(yh - Y, 6.0)
+    dy = np.maximum(yh - Y, px(6.0))
     v = ch * FOCAL / dy
     u = (X - W / 2) * ch / dy
     fp = np.maximum(ch * FOCAL / (dy * dy), ch / dy)
@@ -462,7 +503,7 @@ def cloud_light(dens, lx, ly, step=7.0, kappa=1.1):
     dx, dy = dx / dl, dy / dl
     occ = np.zeros_like(dens)
     for k in (1, 2, 3.5, 5.5):
-        occ += bilc(dens, XX - 0.5 + dx * step * k, YY - 0.5 + dy * step * k)
+        occ += bilc(dens, XX - 0.5 + dx * px(step) * k, YY - 0.5 + dy * px(step) * k)
     return np.exp(-kappa * occ)
 
 
@@ -480,15 +521,15 @@ def snow(rng, n, amp, sigma, length, angle, ymin=0, calm=False):
     y = rng.uniform(ymin, H, n)
     a = rng.uniform(0.25, 1.0, n) ** 2 * amp
     splat(img, x, y, a)
-    out = streak_filter(img, sigma, length, angle)
+    out = streak_filter(img, px(sigma), px(length), angle)
     if calm:
         out = out * calm_mask()
     return np.clip(out, 0, None)
 
 
 def warp(img, ax, ay, scale, seed):
-    dx = fbm(XX / W * scale, YY / W * scale, 2, 0.4, seed) * ax
-    dy = fbm(XX / W * scale + 5.0, YY / W * scale, 2, 0.4, seed + 1) * ay
+    dx = fbm(XX / W * scale, YY / W * scale, 2, 0.4, seed) * px(ax)
+    dy = fbm(XX / W * scale + 5.0, YY / W * scale, 2, 0.4, seed + 1) * px(ay)
     return bil(img, XX - 0.5 + dx, YY - 0.5 + dy)
 
 
@@ -511,7 +552,7 @@ def lightning(rng, x0, y0, x1, y1):
     ss = 2
     im = Image.new("L", (W * ss, H * ss), 0)
     dr = ImageDraw.Draw(im)
-    step = 5.0
+    step = px(5.0)
     segs = []
 
     def walk(x, y, tx, ty, width, bright, depth):
@@ -540,7 +581,7 @@ def lightning(rng, x0, y0, x1, y1):
             pts.append((tx, ty))
         segs.append((pts, width, bright))
 
-    walk(x0, y0, x1, y1, 3.0, 1.0, 0)
+    walk(x0, y0, x1, y1, px(3.0), 1.0, 0)
     for pts, width, bright in sorted(segs, key=lambda s: s[2]):
         m = len(pts)
         for i in range(m - 1):
@@ -550,7 +591,7 @@ def lightning(rng, x0, y0, x1, y1):
                     fill=int(255 * min(1.0, bright * fade)), width=wd)
     b = np.asarray(im, F32) / 255.0
     b = b.reshape(H, ss, W, ss).mean((1, 3))
-    return gblur(b, 0.8)
+    return gblur(b, px(0.8))
 
 
 # --------------------------------------------------------------------------
@@ -580,16 +621,17 @@ def apply_haze(col, G, haze_col, dens, hfall=0.0):
 
 def horizon_colour(sky):
     """Per-column haze colour sampled from the sky just above the horizon."""
-    band = sky[HOR - 40:HOR - 6].mean(0)
-    k = np.ones(161, F32) / 161.0
-    band = np.stack([np.convolve(np.pad(band[:, i], 80, mode="edge"), k, "valid")
+    band = sky[HOR - ipx(40):HOR - ipx(6)].mean(0)
+    half = ipx(80)
+    k = np.ones(2 * half + 1, F32) / (2 * half + 1)
+    band = np.stack([np.convolve(np.pad(band[:, i], half, mode="edge"), k, "valid")
                      for i in range(3)], -1)
     return band[None, :, :].astype(F32)
 
 
 def finish(img, ev, rng, bloom=0.22, vign=0.30, grain=0.011, sat=1.0):
     hi = np.clip(img - 0.35, 0, None)
-    img = img + gblur(hi, 9.0) * bloom + gblur(hi, 30.0) * bloom * 0.6
+    img = img + gblur(hi, px(9.0)) * bloom + gblur(hi, px(30.0)) * bloom * 0.6
     small = img.reshape(H0, S, W0, S, 3).mean((1, 3))
     yy, xx = np.mgrid[0:H0, 0:W0].astype(F32)
     r2 = ((xx - W0 / 2) / (W0 * 0.62)) ** 2 + ((yy - H0 * 0.45) / (H0 * 0.95)) ** 2
@@ -800,12 +842,12 @@ def scene(ev, G):
         sky = sky_gradient(srgb(8, 6, 20), srgb(50, 44, 82), 0.4, seed=10)
         bx0, by0 = 0.56 * W, -0.04 * H          # the channel starts up inside the cloud
         bx1 = 0.50 * W
-        by1 = float(G["skyline"][int(bx1)]) + 6.0
+        by1 = float(G["skyline"][int(bx1)]) + px(6.0)
         alpha, ccol, tex, light = storm_deck(1010, srgb(34, 30, 56), (bx0, 0.16 * H), 0.6)
         bolt = lightning(rng, bx0, by0, bx1, by1)
         # the cloud base swallows the top of the channel
         bolt = bolt * (0.25 + 0.75 * smooth(0.02 * H, 0.16 * H, YY))
-        halo = gblur(bolt, 30.0) * 22.0 + gblur(bolt, 100.0) * 70.0
+        halo = gblur(bolt, px(30.0)) * 22.0 + gblur(bolt, px(100.0)) * 70.0
         src = np.exp(-np.hypot(XX - bx0, (YY - 0.04 * H) * 1.6) / (0.17 * W))
         flash = np.clip(halo + 2.2 * src, 0, 3.5)
         fcol = srgb(200, 205, 255)              # lit areas go blue-white, shadows stay violet
@@ -820,7 +862,7 @@ def scene(ev, G):
         # strike point: a hot glow where the channel meets the ground
         gd = np.hypot(XX - bx1, (YY - by1) * 2.2)
         img += (0.9 * np.exp(-gd / (0.012 * W)) + 0.22 * np.exp(-gd / (0.06 * W)))[..., None] * srgb(215, 220, 255)
-        img += (gblur(bolt, 1.5) * 0.9 + gblur(bolt, 5.0) * 1.0 + gblur(bolt, 16.0) * 1.5)[..., None] * \
+        img += (gblur(bolt, px(1.5)) * 0.9 + gblur(bolt, px(5.0)) * 1.0 + gblur(bolt, px(16.0)) * 1.5)[..., None] * \
             srgb(170, 175, 255)
         img += (bolt * 6.0)[..., None] * srgb(250, 250, 255)
         post = dict(bloom=0.28, vign=0.42)
@@ -840,7 +882,7 @@ def scene(ev, G):
         white = srgb(238, 243, 250)
         ice = srgb(206, 220, 236)
         nst = 520
-        gy = HOR + 6 + (H - HOR - 6) * rng.uniform(0, 1, nst) ** 1.5
+        gy = HOR + px(6) + (H - HOR - px(6)) * rng.uniform(0, 1, nst) ** 1.5
         gx = rng.uniform(0, W, nst)
         gs = (gy - HOR) / (H - HOR)
         far, near = gs < 0.45, gs >= 0.45
@@ -848,8 +890,8 @@ def scene(ev, G):
         st_n = np.zeros((H, W), F32)
         splat(st_f, gx[far], gy[far], rng.uniform(0.3, 1.0, far.sum()) * 0.40)
         splat(st_n, gx[near], gy[near], rng.uniform(0.3, 1.0, near.sum()) * 0.8)
-        stones = streak_filter(st_f, 0.9, 0, 0) + streak_filter(st_n, 1.7, 0, 0)
-        img = img * (1.0 - 0.35 * np.clip(np.roll(stones, (2, -2), (0, 1)), 0, 1) * calm_mask())[..., None]
+        stones = streak_filter(st_f, px(0.9), 0, 0) + streak_filter(st_n, px(1.7), 0, 0)
+        img = img * (1.0 - 0.35 * np.clip(np.roll(stones, (ipx(2), -ipx(2)), (0, 1)), 0, 1) * calm_mask())[..., None]
         img = over(img, 0.85 * stones * calm_mask(), ice)
         # falling stones: round pellets with a short tail, not streaks
         ang = 78.0
@@ -857,14 +899,14 @@ def scene(ev, G):
         for cnt, amp, sig, ln, calm in ((420, 0.70, 1.15, 13, False), (90, 0.95, 1.9, 17, True),
                                         (12, 0.60, 3.4, 22, True)):
             pos = np.zeros((H, W), F32)
-            px, py = rng.uniform(0, W, cnt), rng.uniform(0, H, cnt)
+            qx, qy = rng.uniform(0, W, cnt), rng.uniform(0, H, cnt)
             pa = rng.uniform(0.35, 1.0, cnt) * amp
-            splat(pos, px, py, pa)
-            tail = streak_filter(pos, sig * 0.7, ln, ang)          # faint motion tail
+            splat(pos, qx, qy, pa)
+            tail = streak_filter(pos, px(sig * 0.7), px(ln), ang)          # faint motion tail
             head = np.zeros((H, W), F32)                           # hard bead at the leading end
             a_r = math.radians(ang)
-            splat(head, px + math.cos(a_r) * ln * 0.5, py + math.sin(a_r) * ln * 0.5, pa)
-            bead = np.clip(streak_filter(head, sig, 0, 0), 0, None)
+            splat(head, qx + math.cos(a_r) * px(ln) * 0.5, qy + math.sin(a_r) * px(ln) * 0.5, pa)
+            bead = np.clip(streak_filter(head, px(sig), 0, 0), 0, None)
             lay = np.clip(0.26 * tail, 0, None) + bead
             if calm:
                 lay = lay * calm_mask()
@@ -872,15 +914,15 @@ def scene(ev, G):
         # impact bursts where stones hit the ground
         sp = np.zeros((H, W), F32)
         nimp = 160
-        sy = HOR + 8 + (H - HOR - 8) * rng.uniform(0, 1, nimp) ** 1.6
+        sy = HOR + px(8) + (H - HOR - px(8)) * rng.uniform(0, 1, nimp) ** 1.6
         sx = rng.uniform(0, W, nimp)
         sc = (sy - HOR) / (H - HOR)
         for j in range(7):
-            r = rng.uniform(0.3, 1.0, nimp) * (1.5 + 8.0 * sc)
+            r = rng.uniform(0.3, 1.0, nimp) * px(1.5 + 8.0 * sc)
             a = rng.uniform(-1.2, 1.2, nimp)
             splat(sp, sx + np.sin(a) * r, sy - np.cos(a) * r * 0.8,
                   rng.uniform(0.3, 1.0, nimp) * (0.4 + 0.6 * sc))
-        sp = (gblur(sp, 0.9) * 0.75 + gblur(sp, 4.5) * 2.0) * calm_mask()
+        sp = (gblur(sp, px(0.9)) * 0.75 + gblur(sp, px(4.5)) * 2.0) * K * K * calm_mask()
         img = over(img, sp, white)
         post = dict(bloom=0.15, vign=0.36, sat=0.9)
 
@@ -903,7 +945,7 @@ def scene(ev, G):
         hraw = (yb - YY) / (yb - ytop)
         hgt = np.clip(hraw, 0, 1.2)
         cx = cx0 + 0.030 * W * np.sin(hgt * 3.3 + 0.6) * hgt + 0.012 * W * np.sin(hgt * 9.0 + 2.0) * hgt
-        rad = 8.0 + 0.085 * W * hgt ** 1.7 + 6.0 * hgt
+        rad = px(8.0) + 0.085 * W * hgt ** 1.7 + px(6.0) * hgt
         edge = fbm(XX / W * 2.2, YY / W * 3.5, 5, 0.6, 1213)
         dxn = (XX - cx) / rad + 0.14 * edge
         ins = np.clip(1.0 - dxn * dxn, 0, 1)
@@ -913,7 +955,7 @@ def scene(ev, G):
         back = fbm(-th * 0.20 + hgt * 0.9 + 3.0, hgt * 0.55 + th * 0.05, 5, 0.62, 1215)
         fd = shell * (0.62 + 0.42 * front + 0.26 * back)
         fd = fd * smooth(1.25, 0.55, hgt) * smooth(0.0, 0.035, hraw)
-        fd = gblur(np.clip(fd, 0, None), 2.0)
+        fd = gblur(np.clip(fd, 0, None), px(2.0))
         lit = 0.84 + 0.30 * np.clip(dxn, -1, 1) + 0.16 * front
         pale = srgb(186, 182, 200)
         vcol = pale[None, None, :] * (lit * (0.62 + 0.38 * smooth(1.0, 0.15, hgt)))[..., None]
@@ -947,17 +989,41 @@ def save_jpeg(arr, path):
     return buf.tell(), q
 
 
+def render_view(job):
+    """Build one terrain view and render every requested scene that uses it."""
+    name, evs = job
+    G = build_gbuffer(VIEWS[name])
+    out = []
+    for ev in evs:
+        size, q = save_jpeg(scene(ev, G), os.path.join(OUT_DIR, "w%02d.jpg" % ev))
+        out.append((ev, size, q))
+    return out
+
+
 def main():
-    ids = [int(a) for a in sys.argv[1:]] or list(range(1, 13))
+    args = [a for a in sys.argv[1:] if not a.startswith("--width")]
+    if "--width" in sys.argv:
+        args.remove(sys.argv[sys.argv.index("--width") + 1])
+    ids = [int(a) for a in args] or list(range(1, 13))
     os.makedirs(OUT_DIR, exist_ok=True)
-    views = {}
+    jobs = {}
     for ev in ids:
-        name = EVENT_VIEW[ev]
-        if name not in views:
-            views[name] = build_gbuffer(VIEWS[name])
-        arr = scene(ev, views[name])
-        size, q = save_jpeg(arr, os.path.join(OUT_DIR, "w%02d.jpg" % ev))
+        jobs.setdefault(EVENT_VIEW[ev], []).append(ev)
+    jobs = sorted(jobs.items())
+    # the four views are independent; every random stream is seeded, so the
+    # output is identical whether they run in parallel or one after another
+    nproc = min(len(jobs), os.cpu_count() or 1)
+    if nproc > 1:
+        import multiprocessing as mp
+        with mp.get_context("fork").Pool(nproc) as pool:
+            results = pool.map(render_view, jobs, chunksize=1)
+    else:
+        results = [render_view(j) for j in jobs]
+    total = 0
+    for ev, size, q in sorted(r for res in results for r in res):
+        total += size
         print("w%02d.jpg  %6d bytes  q=%d" % (ev, size, q))
+    print("total    %6d bytes" % total)
 
 
 if __name__ == "__main__":

@@ -1,1023 +1,1463 @@
-/*
- * Icewind Dale Weather Helper - native Win32 build.
+/* main.c - Icewind Dale Almanac, native Win32 front end: the window, the message loop,
+ * input dispatch, EDIT child controls, the owner-drawn popup menu, timers, persistence,
+ * sound and the command-line test hooks. Painting is done by ui_view*.c into g.back;
+ * all behaviour lives in engine.c / store.c (SPEC.md).
  *
- * One window, no child controls, no timers, no animation: everything is painted
- * into a single back-buffer DIB on WM_PAINT and the process sleeps in
- * GetMessage() the rest of the time.
+ * Idle cost: nothing runs while idle. Timers exist only while something is in motion:
+ *   T_PLAY     playback (250 ms ticks; time advances by real elapsed / 1.25 s per hour)
+ *   T_TOAST    one-shot, hides the toast after 4.2 s (day toasts 7 s)
+ *   T_NOTE     one-shot notes autosave debounce (600 ms)
+ *   T_ARM      one-shot, disarms a two-step delete after 3 s
+ *   T_SAVE     one-shot debounced save (ALM_SAVE_SOON_MS = 250 ms, killed when it fires):
+ *              routine steps (hour / day steps, advance, scrubbing, playback stopping,
+ *              calendar paging, select) save non-durably through it. Explicit or
+ *              destructive actions (close / end session, boot, import, settings,
+ *              event add / edit / delete, notes, unit and sound toggles, make-today,
+ *              undo) save durably at once via ui_save_now(), which also cancels a pending
+ *              debounced save (the durable write covers it).
+ *   T_THUNDER  one-shot, re-armed only while sound is on and the viewed hour is a
+ *              Lightning Storm (random 0.8-4.3 s)
+ *   T_FADE     30 ms ticks, 8 at most: hero cross-fade when a discrete step (key or click,
+ *              never playback or scrubbing) changes the weather event
+ * WM_PAINT re-composes the back buffer (view_paint) only when something changed
+ * (ui_redraw / ui_relayout / resize); plain exposes just blit it.
  *
- *   - Scene JPEGs live in the exe as RCDATA 101..112 and are decoded lazily
- *     (GDI+ flat API) into plain 32-bit pixel buffers.
- *   - Scaling is done by a small separable bicubic resampler in this file; the
- *     scaled scene and the composed 24-hour bar are cached, so stepping through
- *     hours or hovering only copies rows and draws a few strings.
- *   - Weather data, progression table and the day generator mirror main.py.
+ * HIT-REGION DISPATCH (id: arg expected here; every id is handled defensively)
+ *   H_NONE, H_TIP          ignored (cover / tooltip only)
+ *   H_SEED            0    Settings with the seed field focused (web: openSettings('seed'))
+ *   H_UNIT_F / H_UNIT_C 0  alm_set_unit
+ *   H_SOUND           0    ui_sound_toggle
+ *   H_SETTINGS, H_FOOT_SETTINGS 0   Settings
+ *   H_ADVANCE         0    alm_advance(12)
+ *   H_PREV_HOUR / H_NEXT_HOUR 0     alm_step_hour(-1 / +1)
+ *   H_CHAIN_X         0    alm_hide_chain_note
+ *   H_DAY_PREV / H_DAY_NEXT 0       alm_step_day(-1 / +1)
+ *   H_PLAY            0    alm_toggle_play
+ *   H_TIMELINE        any  press starts scrubbing: alm_set_time(view_timeline_time(x)),
+ *                          saved on release
+ *   H_CAL_PREV / H_CAL_NEXT 0       alm_cal_step (save debounced 250 ms)
+ *   H_CAL_TODAY       0    alm_cal_today
+ *   H_CAL_CELL        k    index into view_cells(); click = alm_select(abs, true),
+ *                          double click = alm_set_current(abs)..
+ *   H_UPCOMING        abs  alm_select(abs, false)
+ *   H_SET_CURRENT     0    alm_set_current(sel_abs)
+ *   H_EV_EDIT         i    index into alm_marks_on(sel_abs): ui_open_form(marks[i].event)
+ *   H_EV_DEL          i    same index: first press arms (g.armed_id, 3 s), second deletes
+ *   H_ADD_EVENT       0    ui_open_form(NULL)
+ *   H_FORM_TYPE       t    g.form_type = t (AlmEvType)
+ *   H_FORM_REPEAT     0    ui_popup_choice under the hit rect -> g.form_repeat
+ *   H_FORM_CANCEL / H_FORM_SAVE 0   ui_close_form / ui_form_submit
+ *   H_NOTES           0    ui_notes_begin
+ *   H_TOAST           0    dismiss the toast
+ *   H_SCROLL          0 thumb drag (g.sb_grab = y - thumb top), -1 / +1 page up / down
+ *   H_S_*                  settings dialog (handled by ui_settings.c; ignored here)
  *
- * Test hooks: --seed <u32> --newday --hour <0-23> --dump <path> --size WxH
+ * KEYBOARD (main view focused; ignored while a text field has focus) - SPEC 6.2
+ *   Right, Space        +1 hour (crossing midnight on today advances the day, lands 00:00)
+ *   Left                -1 hour
+ *   Home / End          00:00 / 23:00
+ *   N                   Advance Day (lands at 12:00); Enter never advances (too easy to
+ *                       hit twice). Every advance / make-today toasts "Ctrl+Z steps back".
+ *   Ctrl+Z, Backspace   one-level undo of the last advance / make-today / midnight step
+ *   E / O               new event / write a note for the viewed day (scroll restored after)
+ *   F1, ?               keyboard shortcuts card
+ *   Right-click a day   popup: view, add event, write a note, make it today
+ *   PageUp / PageDown   previous / next day
+ *   Up / Down           scroll the page; Ctrl+Home / Ctrl+End top / bottom
+ *   T today (calendar)  P play/pause  U F/C  M sound  F2 or Ctrl+, Settings
+ *   Ctrl+C              copy the seed to the clipboard
+ *   Tab / Shift+Tab     move keyboard focus into / out of the calendar grid
+ *   Grid focus: arrows move (+-1, +-10, festivals row as calendar.js), Home/End,
+ *               Enter/Space select the day, Shift+Enter make it today, Esc/Tab leave.
+ *   Esc                 close the event form / keys card, else leave the grid, else hide
+ *                       the toast, else return to today.
+ * Time-changing keys scroll the page back to the weather. While another day is viewed the
+ * party's own clock is kept (g.party_time) and restored on the way back to today.
+ *   In EDIT fields: Esc closes the form / leaves the notes (flushed); Enter in Title or
+ *   Ctrl+Enter in Details submits; Tab moves between Title and Details; Ctrl+A selects all.
+ *
+ * TEST HOOKS (documented in native/README.md)
+ *   --state <path>  --seed <text>  --days <n>  --select <offset>  --hour <h>
+ *   --size WxH  --scroll <px>  --open settings|eventform  --shot-ready
  */
-#define WIN32_LEAN_AND_MEAN
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-#include <windows.h>
-#include <windowsx.h>
+#include "ui.h"
+#include "ui_blocks.h"
+
+#include <commctrl.h>
+#include <shlobj.h>
 #include <shellapi.h>
-#include <objidl.h>
-#include <shlwapi.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-/* ------------------------------------------------------------------ data */
+/* CONTRACT GAP: provided by ui_view.c (declared there, not in ui.h). */
 
-enum { S_N, S_B, S_I, S_U, S_TITLE, S_COUNT };
+Ui g;
 
-typedef struct { const WCHAR *text; BYTE style; } Run;
-typedef struct { const WCHAR *name; BYTE dice, sides; const Run *runs; int nruns; } Event;
+/* ================================================================== private state */
 
-#include "weather_data.h"
+enum { T_PLAY = 1, T_TOAST, T_NOTE, T_ARM, T_SAVE, T_THUNDER, T_FADE };
+enum { ID_ED_TITLE = 201, ID_ED_DETAILS, ID_ED_NOTES };
+#define WM_APP_DROP_NOTES (WM_APP + 1)
+#define WM_APP_HOOKS      (WM_APP + 2)
 
-/* --------------------------------------------------------------- palette */
-/* Colours are 0xRRGGBB, the same layout as a 32-bit DIB pixel. */
-#define C_BG       0x0B111B
-#define C_BG_SOFT  0x121B29
-#define C_LINE     0x1A2535
-#define C_FRAME    0x2B3B53
-#define C_TEXT     0xD3DCE8
-#define C_BRIGHT   0xFFFFFF
-#define C_ITALIC   0xC6D9EE
-#define C_TITLE    0x86C5F2
-#define C_DIM      0x6C7C93
-#define C_ICE      0xEAF6FF
-#define C_SHADOW   0x04070C
-#define RGB_OF(c)  RGB(((c) >> 16) & 255, ((c) >> 8) & 255, (c) & 255)
+static bool     s_dirty = true;          /* back buffer needs view_paint */
+static bool     s_persist = true;        /* false: --seed without --state (no file writes) */
+static bool     s_save_failed;
+static bool     s_save_pending;          /* a debounced save is scheduled (T_SAVE) */
+static int      s_durable;               /* > 0: ui_apply saves durably at once */
+static WCHAR    s_title[256];            /* last text given to SetWindowTextW */
+static bool     s_title_ready;           /* --shot-ready: first paint done, keep " [ready]" */
+static bool     s_play_timer, s_thunder_timer;
+static int32_t  s_last_sel = INT32_MIN;
+static bool     s_form_scroll;           /* bring the event form into view after the next paint */
+static bool     s_grid_scroll;           /* bring the focused grid cell into view */
+static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
+static HWND     s_tip_tool_owner;
+static RECT     s_tip_rect;
+static HANDLE   s_mutex;
+static int      s_last_type = ALM_EV_REMINDER;   /* type preselected for a new event */
+static WCHAR    s_bad_name[MAX_PATH];            /* corrupt save kept under this name */
+static int      s_boot_notice;                   /* 1 corrupt (renamed), 2 unreadable, 3 rename failed */
 
-/* ---------------------------------------------------------------- state */
+/* one-level undo of a move of "today" (not persisted, no timer) */
+static struct { bool ok; int32_t cur_abs; double time; } s_undo;
 
-enum { F_BODY, F_BOLD, F_ITALIC, F_UNDER, F_TITLE, F_NAME, F_LABEL, F_BTN, F_NUM, F_NUMB, F_SMALL, F_COUNT };
-enum { D_SCENE = 1, D_BAR = 2, D_TEXT = 4, D_BTN = 8, D_ALL = 15 };
-enum { BTN_NEW, BTN_PREV, BTN_NEXT, BTN_COUNT };
+/* test hooks */
+static WCHAR   *s_opt_state;
+static char    *s_opt_seed;
+static int      s_opt_days = -1, s_opt_select = INT32_MIN, s_opt_hour = -1;
+static int      s_opt_w, s_opt_h, s_opt_scroll = -1;
+static int      s_opt_open;              /* 1 settings, 2 eventform */
+static bool     s_opt_shot_ready;
 
-typedef struct { DWORD *px; int w, h; } Image;
-typedef struct { int x, y; unsigned short off, len; BYTE style; } Frag;
-
-static HINSTANCE g_inst;
-static HWND   g_hwnd;
-static HANDLE g_heap;
-static int    g_dpi = 96;
-static HFONT  g_font[F_COUNT];
-
-/* back buffer */
-static HDC     g_dc;
-static HBITMAP g_bmp, g_bmpOld;
-static DWORD  *g_px;
-static int     g_w, g_h;
-static unsigned g_dirty = D_ALL;
-
-/* schedule */
-static BOOL g_has;
-static BYTE g_sched[24];
-static BYTE g_segEvent[24], g_segRoll[24];
-static int  g_nseg;
-static int  g_cur;
-
-/* images and caches */
-static Image     g_img[13];
-static ULONG_PTR g_gdipToken;
-static DWORD *g_scenePx; static int g_sceneW, g_sceneH, g_sceneKey = -1;
-static DWORD *g_barPx;   static int g_barW, g_barH; static BOOL g_barValid;
-
-/* layout */
-static RECT g_rcScene, g_rcBarZone, g_rcBar, g_rcTextZone, g_rcText, g_rcBtnZone, g_rcBtn[BTN_COUNT];
-static int  g_numsTop;
-
-/* text */
-#define TXT_MAX 4096
-#define FRAG_MAX 640
-static WCHAR g_txt[TXT_MAX];
-static BYTE  g_sty[TXT_MAX];
-static int   g_txtLen;
-static Frag  g_frag[FRAG_MAX];
-static int   g_nfrag, g_textH, g_scroll, g_lineH, g_titleH;
-
-/* interaction */
-static int  g_hoverCell = -1, g_hoverBtn = -1, g_pressBtn = -1, g_focusBtn = -1;
-static BOOL g_scrub, g_tracking;
-
-/* ------------------------------------------------------------- utilities */
-
-static void *xalloc(SIZE_T n) { return HeapAlloc(g_heap, 0, n ? n : 1); }
-static void  xfree(void *p)   { if (p) HeapFree(g_heap, 0, p); }
-static int   dp(int v)        { return MulDiv(v, g_dpi, 96); }
-static int   clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
-
-/* xorshift64* seeded through splitmix64; dice use rejection sampling (no modulo bias). */
-static unsigned long long g_rng;
-
-static unsigned long long splitmix(unsigned long long *s)
+static uint32_t rnd32(void)
 {
-    unsigned long long z = (*s += 0x9E3779B97F4A7C15ULL);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
+    s_rng ^= s_rng << 13; s_rng ^= s_rng >> 7; s_rng ^= s_rng << 17;
+    return (uint32_t)(s_rng >> 16);
 }
 
-static void rng_seed(unsigned long long s)
+static bool any_edit_focused(void)
 {
-    g_rng = splitmix(&s);
-    if (!g_rng) g_rng = 0x2545F4914F6CDD1DULL;
+    HWND f = GetFocus();
+    return f && (f == g.ed_title || f == g.ed_details || f == g.ed_notes);
 }
 
-static void rng_seed_os(void)
+/* ================================================================== redraw */
+
+void ui_redraw(void)
 {
-    LARGE_INTEGER qpc; FILETIME ft; POINT pt = {0, 0};
-    unsigned long long s;
-    QueryPerformanceCounter(&qpc);
+    s_dirty = true;
+    if (g.hwnd) InvalidateRect(g.hwnd, NULL, FALSE);
+}
+
+void ui_relayout(void)
+{
+    g.layout_dirty = true;
+    ui_redraw();
+}
+
+/* ================================================================== time, entropy */
+
+double ui_now_ms(void)
+{
+    FILETIME ft; ULARGE_INTEGER u;
     GetSystemTimeAsFileTime(&ft);
-    GetCursorPos(&pt);
-    s = (unsigned long long)qpc.QuadPart;
-    s ^= ((unsigned long long)ft.dwHighDateTime << 32 | ft.dwLowDateTime) * 0x9E3779B97F4A7C15ULL;
-    s ^= (unsigned long long)GetCurrentProcessId() << 40;
-    s ^= (unsigned long long)GetCurrentThreadId() << 20;
-    s ^= (unsigned long long)GetTickCount() << 7;
-    s ^= (unsigned long long)(ULONG_PTR)&qpc << 13;          /* ASLR stack address */
-    s ^= ((unsigned long long)(unsigned)pt.x << 48) ^ ((unsigned long long)(unsigned)pt.y << 3);
-    rng_seed(s);
+    u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    return (double)((u.QuadPart - 116444736000000000ull) / 10000ull);
 }
 
-static unsigned rng_u32(void)
+static uint64_t entropy(void)
 {
-    g_rng ^= g_rng >> 12; g_rng ^= g_rng << 25; g_rng ^= g_rng >> 27;
-    return (unsigned)((g_rng * 0x2545F4914F6CDD1DULL) >> 32);
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    return (uint64_t)q.QuadPart ^ (GetTickCount64() << 20) ^ ((uint64_t)GetCurrentProcessId() << 40)
+           ^ (uint64_t)(ui_now_ms() * 1000.0);
 }
 
-static int roll_die(int sides)
+/* ================================================================== persistence */
+
+static void path_w(const char *utf8, WCHAR *out, int cap)
 {
-    unsigned n = (unsigned)sides, limit = 0xFFFFFFFFu - (0xFFFFFFFFu % n + 1u) % n, r;
-    do r = rng_u32(); while (r > limit);
-    return (int)(r % n) + 1;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, cap) <= 0) out[0] = 0;
 }
 
-/* ------------------------------------------------------------ new_day() */
-/* Same algorithm as main.py: d12 picks the first event, each event rolls its
-   duration dice, the duration is clamped to the hours left in the day and the
-   (unclamped) roll picks the next event; no match falls back to Clear Skies. */
-static void new_day(void)
+static void save_write(bool durable)
 {
-    int ev = roll_die(12), total = 0;
-    g_nseg = 0;
-    while (total < 24) {
-        const Event *e = &EVENTS[ev];
-        int roll = 0, dur, i, next = 0;
-        for (i = 0; i < e->dice; i++) roll += roll_die(e->sides);
-        dur = roll < 24 - total ? roll : 24 - total;
-        for (i = 0; i < dur; i++) g_sched[total + i] = (BYTE)ev;
-        g_segEvent[g_nseg] = (BYTE)ev; g_segRoll[g_nseg] = (BYTE)roll; g_nseg++;
-        total += dur;
-        if (total >= 24) break;
-        for (i = 0; i < 3; i++) {
-            const BYTE *p = PROGRESSION[ev][i];
-            if (p[0] && p[0] <= roll && roll <= p[1]) { next = p[2]; break; }
+    s_save_pending = false;
+    if (g.hwnd) KillTimer(g.hwnd, T_SAVE);
+    if (!s_persist || !g.state_path[0]) return;
+    if (alm_save_file_ex(&g.a, g.state_path, durable) != ALM_IO_OK) {
+        if (!s_save_failed) {
+            s_save_failed = true;
+            ui_toast("<b>Could not save the almanac.</b> Changes live only in memory until a save works; on closing you can save a backup elsewhere.");
         }
-        ev = next ? next : 1;
+    } else {
+        s_save_failed = false;
     }
-    g_cur = 0;
-    g_has = TRUE;
+    if (g.save_failed != s_save_failed) { g.save_failed = s_save_failed; ui_redraw(); }
 }
 
-static BOOL dump_schedule(const WCHAR *path)
+/* explicit / destructive actions: flush now, durably (a pending debounced save is
+ * cancelled: this write already contains its state) */
+void ui_save_now(void)
 {
-    char buf[2048]; int n = 0, i; DWORD wr; HANDLE f;
-    for (i = 0; i < g_nseg; i++)
-        n += wsprintfA(buf + n, i ? " %d:%d" : "%d:%d", g_segEvent[i], g_segRoll[i]);
-    buf[n++] = '\n';
-    for (i = 0; i < 24; i++) {
-        n += wsprintfA(buf + n, "%d\t%d\t", i, g_sched[i]);
-        n += WideCharToMultiByte(CP_UTF8, 0, EVENTS[g_sched[i]].name, -1, buf + n, 64, NULL, NULL) - 1;
-        buf[n++] = '\n';
+    save_write(true);
+}
+
+/* routine steps: one non-durable save ALM_SAVE_SOON_MS after the last of a burst */
+static void save_soon(void)
+{
+    s_save_pending = true;
+    if (g.hwnd) SetTimer(g.hwnd, T_SAVE, ALM_SAVE_SOON_MS, NULL);
+    else save_write(false);
+}
+
+/* ui_apply with ALM_FX_SAVE written durably at once (explicit actions) */
+void ui_apply_durable(AlmResult r)
+{
+    s_durable++;
+    ui_apply(r);
+    s_durable--;
+}
+#define DURABLE(stmt) do { s_durable++; stmt; s_durable--; } while (0)
+
+/* ================================================================== window title */
+
+/* "<date> · HH:00 · <event> <temp>°F — Icewind Dale Almanac", or just the app name before
+ * the first day; SetWindowTextW only when the text changed. */
+static void title_sync(void)
+{
+    static const WCHAR k_app[] = L"Icewind Dale Almanac";
+    WCHAR t[256];
+    if (!g.hwnd) return;
+    t[0] = 0;
+    if (alm_has_view(&g.a) && g.a.view >= 0 && g.a.view < g.a.n_days) {
+        AlmHero hr; char d[IWD_DATE_CAP], hh[8], tp[24], u[256];
+        int hour = alm_hour_now(&g.a);
+        const IwdDay *day = &g.a.days[g.a.view];
+        const IwdEventDef *ev;
+        hour = clampi(hour, 0, 23);
+        ev = iwd_event(day->hour_id[hour]);
+        alm_hero(&g.a, &hr);
+        iwd_format_date(hr.abs, true, d, sizeof d);
+        iwd_fmt_hour((int)floor(g.a.time), hh, sizeof hh);
+        iwd_fmt_temp(day->temp_f[hour], g.a.celsius, tp, sizeof tp);
+        snprintf(u, sizeof u, "%s \xC2\xB7 %s \xC2\xB7 %s %s%s \xE2\x80\x94 ", d, hh,
+                 ev && ev->name ? ev->name : "", tp, g.a.celsius ? "C" : "F");
+        if (MultiByteToWideChar(CP_UTF8, 0, u, -1, t, 200) <= 0) t[0] = 0;
     }
-    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return FALSE;
-    WriteFile(f, buf, (DWORD)n, &wr, NULL);
-    CloseHandle(f);
-    return wr == (DWORD)n;
+    lstrcatW(t, k_app);
+    if (s_title_ready) lstrcatW(t, L" [ready]");
+    if (lstrcmpW(t, s_title) == 0) return;
+    lstrcpynW(s_title, t, (int)(sizeof s_title / sizeof s_title[0]));
+    SetWindowTextW(g.hwnd, t);
 }
 
-/* ------------------------------------------------------- pixel helpers */
-
-static DWORD mix(DWORD d, DWORD c, int a)   /* a = 0..256 weight of c */
+static bool file_exists(const WCHAR *p)
 {
-    DWORD rb = (((d & 0xFF00FF) * (256 - a) + (c & 0xFF00FF) * a) >> 8) & 0xFF00FF;
-    DWORD g  = (((d & 0x00FF00) * (256 - a) + (c & 0x00FF00) * a) >> 8) & 0x00FF00;
-    return rb | g;
+    DWORD a = GetFileAttributesW(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static BOOL clip_rect(int *x0, int *y0, int *x1, int *y1)
+static void to_utf8(const WCHAR *w, char *out, int cap)
 {
-    if (*x0 < 0) *x0 = 0;
-    if (*y0 < 0) *y0 = 0;
-    if (*x1 > g_w) *x1 = g_w;
-    if (*y1 > g_h) *y1 = g_h;
-    return g_px && *x0 < *x1 && *y0 < *y1;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL) <= 0) out[0] = 0;
 }
 
-static void px_fill(int x0, int y0, int x1, int y1, DWORD c)
+/* --state <path>, else a portable state.json next to the exe, else
+ * %APPDATA%\IcewindDaleAlmanac\state.json (directory created). */
+static void resolve_state_path(void)
 {
-    int x, y;
-    if (!clip_rect(&x0, &y0, &x1, &y1)) return;
-    for (y = y0; y < y1; y++) { DWORD *p = g_px + (SIZE_T)y * g_w; for (x = x0; x < x1; x++) p[x] = c; }
-}
-
-static void px_blend(int x0, int y0, int x1, int y1, DWORD c, int a)
-{
-    int x, y;
-    if (!clip_rect(&x0, &y0, &x1, &y1)) return;
-    for (y = y0; y < y1; y++) { DWORD *p = g_px + (SIZE_T)y * g_w; for (x = x0; x < x1; x++) p[x] = mix(p[x], c, a); }
-}
-
-static void px_vgrad(int x0, int y0, int x1, int y1, DWORD top, DWORD bot)
-{
-    int y, h = y1 - y0, oy = y0;
-    for (y = oy; y < y1; y++)
-        px_fill(x0, y, x1, y + 1, mix(top, bot, h > 1 ? (y - oy) * 256 / (h - 1) : 0));
-}
-
-static void px_frame(int x0, int y0, int x1, int y1, int t, DWORD c)
-{
-    px_fill(x0, y0, x1, y0 + t, c); px_fill(x0, y1 - t, x1, y1, c);
-    px_fill(x0, y0 + t, x0 + t, y1 - t, c); px_fill(x1 - t, y0 + t, x1, y1 - t, c);
-}
-
-/* --------------------------------------------------- bicubic resampler */
-/* Separable Catmull-Rom filter whose support widens when shrinking, so the
-   same routine gives sharp enlargements and alias-free reductions. */
-
-typedef struct { int *bounds; int *k; int ksize; } Coeffs;
-
-static double cubic(double x)
-{
-    if (x < 0) x = -x;
-    if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
-    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
-    return 0.0;
-}
-
-static BOOL coeffs_make(Coeffs *c, int in, double in0, double in1, int out)
-{
-    double scale = (in1 - in0) / out, fs = scale < 1.0 ? 1.0 : scale, support = 2.0 * fs;
-    int ksize = (int)support * 2 + 3, xx, i;
-    double *w = (double *)xalloc(sizeof(double) * ksize);
-    c->ksize  = ksize;
-    c->bounds = (int *)xalloc(sizeof(int) * 2 * out);
-    c->k      = (int *)xalloc(sizeof(int) * ksize * out);
-    if (!w || !c->bounds || !c->k) { xfree(w); xfree(c->bounds); xfree(c->k); return FALSE; }
-    for (xx = 0; xx < out; xx++) {
-        double center = in0 + (xx + 0.5) * scale, sum = 0;
-        int xmin = (int)(center - support + 0.5), xmax = (int)(center + support + 0.5), n;
-        if (center - support + 0.5 < 0 || xmin < 0) xmin = 0;
-        if (xmax > in) xmax = in;
-        if (xmin > in - 1) xmin = in - 1;
-        n = xmax - xmin;
-        if (n < 1) n = 1;
-        if (n > ksize) n = ksize;
-        for (i = 0; i < n; i++) { w[i] = cubic((i + xmin - center + 0.5) / fs); sum += w[i]; }
-        if (sum == 0) { w[0] = 1; sum = 1; }
-        for (i = 0; i < n; i++) {
-            double v = w[i] / sum * 16384.0;
-            c->k[xx * ksize + i] = (int)(v < 0 ? v - 0.5 : v + 0.5);
+    WCHAR p[MAX_PATH * 2];
+    p[0] = 0;
+    if (s_opt_state) {
+        if (!GetFullPathNameW(s_opt_state, MAX_PATH * 2, p, NULL)) lstrcpynW(p, s_opt_state, MAX_PATH * 2);
+    } else {
+        WCHAR exe[MAX_PATH * 2]; DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH * 2);
+        if (n > 0 && n < MAX_PATH * 2) {
+            WCHAR *s = exe + n;
+            while (s > exe && s[-1] != L'\\' && s[-1] != L'/') s--;
+            *s = 0;
+            lstrcpynW(p, exe, MAX_PATH * 2);
+            lstrcatW(p, L"state.json");
+            if (!file_exists(p)) p[0] = 0;
         }
-        c->bounds[xx * 2] = xmin; c->bounds[xx * 2 + 1] = n;
+        if (!p[0]) {
+            WCHAR base[MAX_PATH * 2];
+            DWORD k = GetEnvironmentVariableW(L"APPDATA", base, MAX_PATH * 2);
+            if (k == 0 || k >= MAX_PATH * 2) {
+                if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA | CSIDL_FLAG_CREATE, NULL, 0, base))) base[0] = 0;
+            }
+            if (base[0]) {
+                char dir[MAX_PATH * 3];
+                lstrcpynW(p, base, MAX_PATH * 2);
+                lstrcatW(p, L"\\IcewindDaleAlmanac");
+                to_utf8(p, dir, sizeof dir);
+                alm_fs_mkdirs(dir);
+                lstrcatW(p, L"\\state.json");
+            } else {
+                lstrcpyW(p, L"state.json");
+            }
+        }
     }
-    xfree(w);
+    to_utf8(p, g.state_path, (int)sizeof g.state_path);
+}
+
+/* {"v":2,"seed":"..."} so --seed goes through clean() like any loaded state */
+static void load_seeded(const char *seed)
+{
+    size_t n = strlen(seed), i, k = 0;
+    char *j = (char *)malloc(n * 6 + 32);
+    if (!j) return;
+    k += (size_t)sprintf(j, "{\"v\":2,\"seed\":\"");
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)seed[i];
+        if (c == '"' || c == '\\') { j[k++] = '\\'; j[k++] = (char)c; }
+        else if (c < 0x20) k += (size_t)sprintf(j + k, "\\u%04x", c);
+        else j[k++] = (char)c;
+    }
+    k += (size_t)sprintf(j + k, "\"}");
+    alm_load_json(&g.a, j, k);
+    free(j);
+}
+
+/* ================================================================== toasts */
+
+static void toast_timer(int ms)
+{
+    if (g.hwnd) SetTimer(g.hwnd, T_TOAST, (UINT)ms, NULL);
+}
+
+void ui_toast(const char *text)
+{
+    if (!text || !*text) return;
+    lstrcpynA(g.toast, text, ALM_TOAST_CAP);
+    g.toast_day = false;
+    g.toast_on = true;
+    g.toast_sticky = false;
+    g.toast_hint[0] = 0;
+    toast_timer(ALM_TOAST_MS);
+    ui_redraw();
+}
+
+static void day_toast(int32_t abs, const char *lead)
+{
+    char title[160]; AlmMark mk[2]; int n = 0;
+    if (!alm_day_toast(&g.a, abs, lead ? lead : "Today", title, sizeof title, mk, 2, &n)) return;
+    g.toast_day = true;
+    g.toast_abs = abs;
+    lstrcpynA(g.toast_lead, lead ? lead : "Today", (int)sizeof g.toast_lead);
+    g.toast[0] = 0;
+    g.toast_on = true;
+    g.toast_sticky = false;
+    g.toast_hint[0] = 0;
+    toast_timer(ALM_DAY_TOAST_MS);
+    ui_redraw();
+}
+
+static void toast_sticky(const char *text)
+{
+    ui_toast(text);
+    KillTimer(g.hwnd, T_TOAST);
+    g.toast_sticky = true;
+}
+
+static void toast_hide(void)
+{
+    if (!g.toast_on) return;
+    g.toast_on = false;
+    g.toast_sticky = false;
+    KillTimer(g.hwnd, T_TOAST);
+    ui_redraw();
+}
+
+/* ================================================================== sound */
+
+static int viewed_event(void)
+{
+    return alm_event_at(&g.a, g.a.view, alm_hour_now(&g.a));
+}
+
+static void thunder_sync(void)
+{
+    bool want = audio_is_enabled() && alm_has_view(&g.a) && viewed_event() == 10;
+    if (want && !s_thunder_timer) {
+        SetTimer(g.hwnd, T_THUNDER, 800 + rnd32() % 3500, NULL);
+        s_thunder_timer = true;
+    } else if (!want && s_thunder_timer) {
+        KillTimer(g.hwnd, T_THUNDER);
+        s_thunder_timer = false;
+    }
+}
+
+static void wind_sync(bool force)
+{
+    int id = viewed_event();
+    const IwdLook *lk;
+    if (!force && id == g.last_wind_event) { thunder_sync(); return; }
+    g.last_wind_event = id;
+    lk = iwd_look(id);
+    audio_set_wind(lk ? lk->wind : 0.0);
+    thunder_sync();
+}
+
+void ui_sound_toggle(void)
+{
+    bool want = !audio_is_enabled();
+    bool ok = audio_set_enabled(want);
+    if (want && !ok) {
+        g.sound_missing = true;
+        g.a.native.sound = false;
+    } else {
+        g.sound_missing = false;
+        g.a.native.sound = want;
+    }
+    wind_sync(true);
+    ui_save_now();
+    ui_redraw();
+}
+
+/* ================================================================== EDIT controls */
+
+static HMODULE s_uxtheme;
+typedef HRESULT (WINAPI *SetWindowThemeFn)(HWND, LPCWSTR, LPCWSTR);
+
+static void dark_theme(HWND h, const WCHAR *app)
+{
+    static SetWindowThemeFn fn; static bool tried;
+    if (!tried) {
+        tried = true;
+        s_uxtheme = LoadLibraryW(L"uxtheme.dll");
+        if (s_uxtheme) fn = (SetWindowThemeFn)(void (*)(void))GetProcAddress(s_uxtheme, "SetWindowTheme");
+    }
+    if (fn && h) fn(h, app, NULL);
+}
+
+void ui_style_edit(HWND ed, int fnt)
+{
+    if (!ed) return;
+    if (fnt < 0 || fnt >= F_COUNT) fnt = F_BODY;
+    SetPropW(ed, L"iwd.font", (HANDLE)(INT_PTR)(fnt + 1));
+    SendMessageW(ed, WM_SETFONT, (WPARAM)font(fnt), TRUE);
+    SendMessageW(ed, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(dp(2), dp(2)));
+    if (GetWindowLongPtrW(ed, GWL_STYLE) & ES_MULTILINE) dark_theme(ed, L"DarkMode_Explorer");
+}
+
+/* heap WCHAR copy of UTF-8 with \n expanded to \r\n */
+static WCHAR *crlf_dup(const char *utf8)
+{
+    WCHAR *w = wz_dup(utf8 ? utf8 : ""), *o;
+    size_t n = 0, i, k = 0;
+    if (!w) return NULL;
+    for (i = 0; w[i]; i++) n += (w[i] == L'\n' && (i == 0 || w[i - 1] != L'\r')) ? 2 : 1;
+    o = (WCHAR *)malloc((n + 1) * sizeof(WCHAR));
+    if (!o) return w;
+    for (i = 0; w[i]; i++) {
+        if (w[i] == L'\n' && (i == 0 || w[i - 1] != L'\r')) o[k++] = L'\r';
+        o[k++] = w[i];
+    }
+    o[k] = 0;
+    free(w);
+    return o;
+}
+
+char *ui_edit_text(HWND ed)
+{
+    int n; WCHAR *w; char *u; int i, k = 0;
+    if (!ed) return NULL;
+    n = GetWindowTextLengthW(ed);
+    w = (WCHAR *)malloc(((size_t)n + 1) * sizeof(WCHAR));
+    if (!w) return NULL;
+    n = GetWindowTextW(ed, w, n + 1);
+    if (n < 0) n = 0;
+    for (i = 0; i < n; i++) {                           /* \r\n -> \n (textarea value) */
+        if (w[i] == L'\r' && i + 1 < n && w[i + 1] == L'\n') continue;
+        w[k++] = w[i];
+    }
+    w[k] = 0;
+    u = u8_dup(w);
+    free(w);
+    return u;
+}
+
+static void notes_drop(void);
+
+/* Esc / Tab in the notes: back to the page (and to the weather if a shortcut opened it) */
+static void notes_leave(void)
+{
+    SetFocus(g.hwnd);
+    if (g.saved_scroll >= 0) { view_scroll_to(g.saved_scroll); g.saved_scroll = -1; }
+}
+
+static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WNDPROC old = (WNDPROC)GetPropW(h, L"iwd.proc");
+    HWND parent = GetParent(h);
+    bool mine = parent == g.hwnd;
+    bool multi = (GetWindowLongPtrW(h, GWL_STYLE) & ES_MULTILINE) != 0;
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if (!old) return DefWindowProcW(h, msg, wp, lp);
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wp == 'A' && ctrl) { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
+        if (!mine) {
+            /* settings dialog fields: Esc / Tab / Enter (single line) go to the dialog */
+            if (wp == VK_ESCAPE || wp == VK_TAB || (wp == VK_RETURN && !multi)) {
+                SendMessageW(parent, WM_KEYDOWN, wp, lp);
+                return 0;
+            }
+            break;
+        }
+        if (wp == VK_ESCAPE) {
+            if (h == g.ed_notes) notes_leave();
+            else ui_close_form();
+            return 0;
+        }
+        if (wp == VK_TAB) {
+            if (h == g.ed_notes) notes_leave();
+            else if (h == g.ed_title && g.ed_details) SetFocus(g.ed_details);
+            else if (h == g.ed_details && g.ed_title) SetFocus(g.ed_title);
+            (void)shift;
+            return 0;
+        }
+        if (wp == VK_RETURN && ((h == g.ed_title) || (h == g.ed_details && ctrl))) {
+            ui_form_submit();
+            return 0;
+        }
+        break;
+    case WM_CHAR:
+        if (wp == 27 || wp == L'\t') return 0;                 /* no beep */
+        if ((wp == L'\r' || wp == L'\n') && (!multi || (mine && h == g.ed_details && ctrl))) return 0;
+        if (wp == 1 && ctrl) return 0;                          /* Ctrl+A */
+        break;
+    case WM_MOUSEWHEEL:
+        if (!multi && parent) return SendMessageW(parent, msg, wp, lp);
+        break;
+    case WM_NCDESTROY:
+        RemovePropW(h, L"iwd.proc");
+        RemovePropW(h, L"iwd.font");
+        SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+        return CallWindowProcW(old, h, msg, wp, lp);
+    default:
+        break;
+    }
+    return CallWindowProcW(old, h, msg, wp, lp);
+}
+
+HWND ui_make_edit(HWND parent, int id, bool multiline, int maxlen, int fnt, const char *text_utf8)
+{
+    DWORD st = WS_CHILD | WS_TABSTOP | (multiline ? (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) : ES_AUTOHSCROLL);
+    HWND ed = CreateWindowExW(0, L"EDIT", L"", st, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, g.inst, NULL);
+    WCHAR *w;
+    if (!ed) return NULL;
+    SetPropW(ed, L"iwd.proc", (HANDLE)GetWindowLongPtrW(ed, GWLP_WNDPROC));
+    SetWindowLongPtrW(ed, GWLP_WNDPROC, (LONG_PTR)edit_proc);
+    if (maxlen > 0) SendMessageW(ed, EM_SETLIMITTEXT, (WPARAM)maxlen, 0);
+    ui_style_edit(ed, fnt);
+    if (text_utf8 && *text_utf8) {
+        w = multiline ? crlf_dup(text_utf8) : wz_dup(text_utf8);
+        if (w) { SetWindowTextW(ed, w); free(w); }
+    }
+    return ed;
+}
+
+/* multiline EDITs show their scrollbar only when the text overflows */
+static void edit_vsb(HWND ed)
+{
+    RECT r; int lines, vis, lh = fh(F_BODY) > 0 ? fh(F_BODY) : 16;
+    bool want, has;
+    if (!ed || !(GetWindowLongPtrW(ed, GWL_STYLE) & ES_MULTILINE)) return;
+    GetClientRect(ed, &r);
+    lines = (int)SendMessageW(ed, EM_GETLINECOUNT, 0, 0);
+    vis = (r.bottom - r.top) / lh;
+    has = (GetWindowLongPtrW(ed, GWL_STYLE) & WS_VSCROLL) != 0;
+    want = lines > (vis > 0 ? vis : 1);
+    /* with the bar the text column narrows and may re-wrap: keep it while still needed */
+    if (want != has) ShowScrollBar(ed, SB_VERT, want);
+}
+
+/* --- placement of the main window's EDITs from the content rects (after each paint) */
+
+typedef struct EdPlace { HWND ed; RECT r; int clip0, clip1; bool shown; } EdPlace;
+static EdPlace s_place[3];
+
+static void edit_place(int slot, HWND ed, const RECT *rc)
+{
+    EdPlace *p = &s_place[slot];
+    int hh = view_header_h(), H = g.back.h, y0, y1, w, h, c0, c1;
+    RECT nr;
+    if (p->ed != ed) { memset(p, 0, sizeof *p); p->ed = ed; }
+    if (!ed) return;
+    if (IsRectEmpty(rc)) {
+        if (p->shown || IsWindowVisible(ed)) ShowWindow(ed, SW_HIDE);
+        p->shown = false;
+        return;
+    }
+    y0 = rc->top - g.scroll + hh; y1 = rc->bottom - g.scroll + hh;
+    w = rc->right - rc->left; h = y1 - y0;
+    c0 = clampi(hh - y0, 0, h); c1 = clampi(H - y0, 0, h);
+    if (c1 <= c0 || w <= 0) {
+        if (p->shown) ShowWindow(ed, SW_HIDE);
+        p->shown = false;
+        return;
+    }
+    SetRect(&nr, rc->left, y0, rc->right, y1);
+    if (!EqualRect(&nr, &p->r) || !p->shown) {
+        bool resized = nr.right - nr.left != p->r.right - p->r.left;
+        bool resized_h = nr.bottom - nr.top != p->r.bottom - p->r.top;
+        SetWindowPos(ed, HWND_TOP, nr.left, nr.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (resized && !(GetWindowLongPtrW(ed, GWL_STYLE) & ES_MULTILINE)) {
+            /* the EDIT was created 10 px wide and scrolled horizontally to keep the caret
+               (end of the selected title) in view; re-apply the selection at the real width
+               so the text starts at the left edge again */
+            DWORD s0 = 0, s1 = 0;
+            SendMessageW(ed, EM_GETSEL, (WPARAM)&s0, (LPARAM)&s1);
+            SendMessageW(ed, EM_SETSEL, 0, 0);
+            SendMessageW(ed, EM_SCROLLCARET, 0, 0);
+            SendMessageW(ed, EM_SETSEL, (WPARAM)s0, (LPARAM)s1);
+        }
+        p->r = nr;
+        p->shown = true;
+        if (resized || resized_h) edit_vsb(ed);
+    }
+    if (c0 != p->clip0 || c1 != p->clip1) {
+        if (c0 == 0 && c1 == h) SetWindowRgn(ed, NULL, TRUE);
+        else SetWindowRgn(ed, CreateRectRgn(0, c0, w, c1), TRUE);
+        p->clip0 = c0; p->clip1 = c1;
+    }
+}
+
+static void edits_sync(void)
+{
+    /* a fresh EdPlace starts with clip 0..0, so the first placement always sets the region */
+    edit_place(0, g.ed_title, &g.rc_title);
+    edit_place(1, g.ed_details, &g.rc_details);
+    edit_place(2, g.ed_notes, &g.rc_notes);
+}
+
+/* ================================================================== event form */
+
+void ui_open_form(const AlmEvent *ev)
+{
+    ui_notes_flush();
+    if (g.form_open) ui_close_form();
+    g.form_open = true;
+    g.form_invalid = false;
+    if (ev) {
+        lstrcpynA(g.form_id, ev->id ? ev->id : "", (int)sizeof g.form_id);
+        g.form_type = ev->type;
+        g.form_repeat = ev->repeat;
+    } else {
+        g.form_id[0] = 0;
+        g.form_type = s_last_type;             /* last used type (first: Reminder) */
+        g.form_repeat = IWD_REPEAT_NONE;
+    }
+    g.ed_title = ui_make_edit(g.hwnd, ID_ED_TITLE, false, ALM_TITLE_MAX_UNITS, F_BODY, ev ? ev->title : "");
+    g.ed_details = ui_make_edit(g.hwnd, ID_ED_DETAILS, true, ALM_DETAILS_MAX_UNITS, F_BODY, ev ? ev->details : "");
+    SetRectEmpty(&g.rc_title);
+    SetRectEmpty(&g.rc_details);
+    if (g.ed_title) { SetFocus(g.ed_title); SendMessageW(g.ed_title, EM_SETSEL, 0, -1); }
+    s_form_scroll = true;
+    ui_relayout();
+}
+
+void ui_close_form(void)
+{
+    bool had_focus = any_edit_focused() && GetFocus() != g.ed_notes;
+    if (!g.form_open && !g.ed_title && !g.ed_details) return;
+    g.form_open = false;
+    g.form_id[0] = 0;
+    g.form_invalid = false;
+    if (had_focus) SetFocus(g.hwnd);
+    if (g.ed_title) { DestroyWindow(g.ed_title); g.ed_title = NULL; }
+    if (g.ed_details) { DestroyWindow(g.ed_details); g.ed_details = NULL; }
+    SetRectEmpty(&g.rc_title);
+    SetRectEmpty(&g.rc_details);
+    ui_relayout();
+    if (g.saved_scroll >= 0) {               /* opened by a shortcut: back to where the DM was */
+        view_layout();
+        view_scroll_to(g.saved_scroll);
+        g.saved_scroll = -1;
+    }
+}
+
+static bool blank_w(const char *u)
+{
+    WCHAR *w = wz_dup(u ? u : ""), *p;
+    bool blank = true;
+    if (!w) return true;
+    for (p = w; *p; p++)
+        if (!(*p == L' ' || (*p >= 9 && *p <= 13) || *p == 0xA0 || *p == 0xFEFF || *p == 0x1680 ||
+              (*p >= 0x2000 && *p <= 0x200A) || *p == 0x2028 || *p == 0x2029 || *p == 0x202F ||
+              *p == 0x205F || *p == 0x3000)) { blank = false; break; }
+    free(w);
+    return blank;
+}
+
+void ui_form_submit(void)
+{
+    char *title, *details;
+    bool upd = false;
+    AlmResult r;
+    if (!g.form_open) return;
+    title = ui_edit_text(g.ed_title);
+    details = ui_edit_text(g.ed_details);
+    if (!title || blank_w(title)) {
+        g.form_invalid = true;
+        if (g.ed_title) SetFocus(g.ed_title);
+        free(title); free(details);
+        ui_redraw();
+        return;
+    }
+    r = alm_event_save(&g.a, g.form_id[0] ? g.form_id : NULL, g.a.sel_abs, title,
+                       (AlmEvType)clampi(g.form_type, 0, ALM_EV_TYPE_COUNT - 1),
+                       (IwdRepeat)clampi(g.form_repeat, 0, IWD_REPEAT_COUNT - 1),
+                       details ? details : "", ui_now_ms(), &upd);
+    free(title); free(details);
+    if (r.fx & ALM_FX_REJECTED) {
+        if (!(r.fx & ALM_FX_TOAST)) { g.form_invalid = true; if (g.ed_title) SetFocus(g.ed_title); }
+        ui_apply(r);
+        ui_redraw();
+        return;
+    }
+    g.armed_id[0] = 0;
+    if (!g.form_id[0]) s_last_type = clampi(g.form_type, 0, ALM_EV_TYPE_COUNT - 1);
+    ui_close_form();
+    ui_apply_durable(r);
+}
+
+/* ================================================================== notes */
+
+static void notes_drop(void)
+{
+    if (!g.ed_notes) return;
+    if (GetFocus() == g.ed_notes) SetFocus(g.hwnd);
+    DestroyWindow(g.ed_notes);
+    g.ed_notes = NULL;
+    ui_redraw();
+}
+
+void ui_notes_flush(void)
+{
+    char *t;
+    AlmResult r;
+    KillTimer(g.hwnd, T_NOTE);
+    if (!g.ed_notes || !g.note_pending) return;
+    g.note_pending = false;
+    t = ui_edit_text(g.ed_notes);
+    r = alm_note_set(&g.a, g.notes_abs, t ? t : "");
+    free(t);
+    g.note_state = 2;
+    g.rev++;
+    ui_apply_durable(r);
+    ui_redraw();
+}
+
+void ui_notes_begin(void)
+{
+    if (g.ed_notes && g.notes_abs != g.a.sel_abs) { ui_notes_flush(); notes_drop(); }
+    if (!g.ed_notes) {
+        g.notes_abs = g.a.sel_abs;
+        g.note_pending = false;
+        g.note_state = 0;
+        g.ed_notes = ui_make_edit(g.hwnd, ID_ED_NOTES, true, ALM_MAX_NOTE_BYTES / 4, F_BODY,
+                                  alm_note_get(&g.a, g.notes_abs));
+        memset(&s_place[2], 0, sizeof s_place[2]);
+        edit_place(2, g.ed_notes, &g.rc_notes);
+    }
+    if (g.ed_notes) {
+        int n = GetWindowTextLengthW(g.ed_notes);
+        SetFocus(g.ed_notes);
+        SendMessageW(g.ed_notes, EM_SETSEL, (WPARAM)n, (LPARAM)n);
+    }
+    ui_redraw();
+}
+
+/* ================================================================== popup choice menu */
+
+/* ui_popup_choice: x, y are SCREEN coordinates of the menu's top-left corner (ui_settings.c
+ * passes screen coordinates); w is the minimum width. Returns the chosen index or -1. The
+ * owner window must forward WM_MEASUREITEM / WM_DRAWITEM to ui_menu_measure / ui_menu_draw. */
+
+static const char *const *s_pop_labels;
+static int s_pop_n, s_pop_sel, s_pop_w;
+static HBRUSH s_menu_br;
+
+int ui_popup_choice(HWND owner, int x, int y, int w, const char *const *labels, int n, int sel)
+{
+    HMENU m; POINT p; int i, r; MENUINFO mi;
+    if (!labels || n <= 0) return -1;
+    m = CreatePopupMenu();
+    if (!m) return -1;
+    if (!s_menu_br) s_menu_br = CreateSolidBrush(RGB_OF(C_PANEL2));
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi; mi.fMask = MIM_BACKGROUND; mi.hbrBack = s_menu_br;
+    SetMenuInfo(m, &mi);
+    s_pop_labels = labels; s_pop_n = n; s_pop_sel = sel; s_pop_w = w;
+    for (i = 0; i < n; i++) AppendMenuW(m, MF_OWNERDRAW, (UINT_PTR)(i + 1), (LPCWSTR)(INT_PTR)(i + 1));
+    p.x = x; p.y = y;                         /* screen coordinates */
+    r = (int)TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY | TPM_LEFTBUTTON,
+                              p.x, p.y, owner, NULL);
+    DestroyMenu(m);
+    s_pop_labels = NULL; s_pop_n = 0;
+    return r >= 1 && r <= n ? r - 1 : -1;
+}
+
+LRESULT ui_menu_measure(MEASUREITEMSTRUCT *mi)
+{
+    int i, wmax = 0, chk = GetSystemMetrics(SM_CXMENUCHECK);
+    if (!mi || mi->CtlType != ODT_MENU || !s_pop_labels) return FALSE;
+    for (i = 0; i < s_pop_n; i++) {
+        int t = tw(F_BODY, wz(s_pop_labels[i]), -1);
+        if (t > wmax) wmax = t;
+    }
+    wmax += dp(28);
+    if (s_pop_w - chk > wmax) wmax = s_pop_w - chk;
+    mi->itemWidth = (UINT)(wmax > 0 ? wmax : dp(80));
+    mi->itemHeight = (UINT)(fh(F_BODY) + dp(10));
     return TRUE;
 }
 
-static int clamp8(int v) { v = (v + 8192) >> 14; return v < 0 ? 0 : v > 255 ? 255 : v; }
-
-/* Resamples the source box (sx0,sy0)-(sx1,sy1) into dst (dw x dh, row pitch dpitch pixels). */
-static void resample(const DWORD *src, int sw, int sh, double sx0, double sy0, double sx1, double sy1,
-                     DWORD *dst, int dw, int dh, int dpitch)
+LRESULT ui_menu_draw(DRAWITEMSTRUCT *di)
 {
-    Coeffs cx, cy; DWORD *tmp; int ymin, ymax, x, y, i, rows;
-    if (dw <= 0 || dh <= 0) return;
-    if (!coeffs_make(&cx, sw, sx0, sx1, dw)) return;
-    if (!coeffs_make(&cy, sh, sy0, sy1, dh)) { xfree(cx.bounds); xfree(cx.k); return; }
-    ymin = cy.bounds[0]; ymax = cy.bounds[(dh - 1) * 2] + cy.bounds[(dh - 1) * 2 + 1];
-    rows = ymax - ymin;
-    tmp = (DWORD *)xalloc(sizeof(DWORD) * (SIZE_T)dw * rows);
-    if (tmp) {
-        for (y = 0; y < rows; y++) {                       /* horizontal pass */
-            const DWORD *s = src + (SIZE_T)(y + ymin) * sw; DWORD *t = tmp + (SIZE_T)y * dw;
-            for (x = 0; x < dw; x++) {
-                const int *k = cx.k + x * cx.ksize; const DWORD *p = s + cx.bounds[x * 2];
-                int n = cx.bounds[x * 2 + 1], r = 0, g = 0, b = 0;
-                for (i = 0; i < n; i++) { DWORD v = p[i]; int kk = k[i];
-                    r += (int)((v >> 16) & 255) * kk; g += (int)((v >> 8) & 255) * kk; b += (int)(v & 255) * kk; }
-                t[x] = (DWORD)(clamp8(r) << 16 | clamp8(g) << 8 | clamp8(b));
-            }
-        }
-        for (y = 0; y < dh; y++) {                         /* vertical pass */
-            const int *k = cy.k + y * cy.ksize; int n = cy.bounds[y * 2 + 1];
-            const DWORD *base = tmp + (SIZE_T)(cy.bounds[y * 2] - ymin) * dw; DWORD *d = dst + (SIZE_T)y * dpitch;
-            for (x = 0; x < dw; x++) {
-                int r = 0, g = 0, b = 0;
-                for (i = 0; i < n; i++) { DWORD v = base[(SIZE_T)i * dw + x]; int kk = k[i];
-                    r += (int)((v >> 16) & 255) * kk; g += (int)((v >> 8) & 255) * kk; b += (int)(v & 255) * kk; }
-                d[x] = (DWORD)(clamp8(r) << 16 | clamp8(g) << 8 | clamp8(b));
-            }
-        }
-        xfree(tmp);
+    int i; bool selnow, cur; RECT r; HDC dc; HGDIOBJ of;
+    if (!di || di->CtlType != ODT_MENU || !s_pop_labels) return FALSE;
+    i = (int)di->itemData - 1;
+    if (i < 0 || i >= s_pop_n) return FALSE;
+    dc = di->hDC; r = di->rcItem;
+    selnow = (di->itemState & ODS_SELECTED) != 0;
+    cur = i == s_pop_sel;
+    SelectObject(dc, GetStockObject(DC_BRUSH));
+    SetDCBrushColor(dc, RGB_OF(selnow ? mix(C_PANEL2, C_ACCENT, 60) : C_PANEL2));
+    PatBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, PATCOPY);
+    if (cur) {
+        SetDCBrushColor(dc, RGB_OF(C_ACCENT));
+        PatBlt(dc, r.left, r.top + dp(4), dp(2) < 2 ? 2 : dp(2), r.bottom - r.top - dp(8), PATCOPY);
     }
-    xfree(cx.bounds); xfree(cx.k); xfree(cy.bounds); xfree(cy.k);
+    of = SelectObject(dc, font(cur ? F_BODY_B : F_BODY));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB_OF(selnow || cur ? C_BRIGHT : C_TEXT));
+    r.left += dp(12); r.right -= dp(8);
+    DrawTextW(dc, wz(s_pop_labels[i]), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+    return TRUE;
 }
 
-/* Cover-fit: fills dw x dh completely, cropping the source around its centre. */
-static void resample_cover(const Image *im, DWORD *dst, int dw, int dh, int dpitch)
+/* ================================================================== settings */
+
+void ui_open_settings(bool focus_seed)
 {
-    double x0 = 0, y0 = 0, x1 = im->w, y1 = im->h;
-    if ((double)dw * im->h > (double)dh * im->w) {
-        double ch = (double)im->w * dh / dw; y0 = (im->h - ch) / 2; y1 = y0 + ch;
-    } else {
-        double cw = (double)im->h * dw / dh; x0 = (im->w - cw) / 2; x1 = x0 + cw;
+    ui_notes_flush();
+    if (g.ed_notes) notes_drop();
+    toast_hide();
+    settings_open(focus_seed);
+}
+
+static void state_sync(void);
+
+void ui_after_settings(bool changed)
+{
+    g.rev++;
+    if (changed) {
+        if (g.form_open && g.form_id[0] && !alm_event_find(&g.a, g.form_id)) ui_close_form();
+        if (g.armed_id[0] && !alm_event_find(&g.a, g.armed_id)) g.armed_id[0] = 0;
+        if (g.ed_notes) notes_drop();
+        view_invalidate_timeline();
+        s_last_sel = INT32_MIN;
+        state_sync();
+        ui_save_now();
     }
-    resample(im->px, im->w, im->h, x0, y0, x1, y1, dst, dw, dh, dpitch);
+    wind_sync(true);
+    title_sync();
+    ui_relayout();
+    if (g.hwnd && IsWindowEnabled(g.hwnd)) SetFocus(g.hwnd);
 }
 
-/* ---------------------------------------------- JPEG decoding (GDI+ flat) */
+/* ================================================================== action results */
 
-typedef struct { UINT32 GdiplusVersion; void *DebugEventCallback; BOOL SuppressBackgroundThread; BOOL SuppressExternalCodecs; } GpStartupInput;
-typedef struct { UINT Width, Height; INT Stride; INT PixelFormat; void *Scan0; UINT_PTR Reserved; } GpBitmapData;
-typedef struct { INT X, Y, Width, Height; } GpRectI;
-int  WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupInput *input, void *output);
-void WINAPI GdiplusShutdown(ULONG_PTR token);
-int  WINAPI GdipCreateBitmapFromStream(IStream *stream, void **bitmap);
-int  WINAPI GdipGetImageWidth(void *image, UINT *width);
-int  WINAPI GdipGetImageHeight(void *image, UINT *height);
-int  WINAPI GdipBitmapLockBits(void *bitmap, const GpRectI *rect, UINT flags, INT format, GpBitmapData *data);
-int  WINAPI GdipBitmapUnlockBits(void *bitmap, GpBitmapData *data);
-int  WINAPI GdipDisposeImage(void *image);
-#define GP_PIXFMT_32RGB 0x00022009
-
-static BOOL decode_jpeg(int id, Image *out)
+static void play_sync(void)
 {
-    HRSRC res = FindResourceW(NULL, MAKEINTRESOURCEW(100 + id), (LPCWSTR)RT_RCDATA);
-    HGLOBAL hg = res ? LoadResource(NULL, res) : NULL;
-    const BYTE *data = hg ? (const BYTE *)LockResource(hg) : NULL;
-    DWORD size = res ? SizeofResource(NULL, res) : 0;
-    IStream *stm; void *bmp = NULL; BOOL ok = FALSE;
-    if (!data || !size) return FALSE;
-    if (!g_gdipToken) {
-        GpStartupInput in = { 1, NULL, FALSE, FALSE };
-        if (GdiplusStartup(&g_gdipToken, &in, NULL) != 0) { g_gdipToken = 0; return FALSE; }
-    }
-    stm = SHCreateMemStream(data, size);
-    if (!stm) return FALSE;
-    if (GdipCreateBitmapFromStream(stm, &bmp) == 0 && bmp) {
-        UINT w = 0, h = 0; GpBitmapData bd; GpRectI rc;
-        GdipGetImageWidth(bmp, &w); GdipGetImageHeight(bmp, &h);
-        rc.X = 0; rc.Y = 0; rc.Width = (INT)w; rc.Height = (INT)h;
-        if (w && h && w <= 8192 && h <= 8192 && GdipBitmapLockBits(bmp, &rc, 1, GP_PIXFMT_32RGB, &bd) == 0) {
-            DWORD *px = (DWORD *)xalloc(sizeof(DWORD) * (SIZE_T)w * h);
-            if (px) {
-                UINT x, y;
-                for (y = 0; y < h; y++) {
-                    const DWORD *s = (const DWORD *)((const BYTE *)bd.Scan0 + (INT_PTR)y * bd.Stride);
-                    DWORD *d = px + (SIZE_T)y * w;
-                    for (x = 0; x < w; x++) d[x] = s[x] & 0xFFFFFF;
-                }
-                out->px = px; out->w = (int)w; out->h = (int)h; ok = TRUE;
-            }
-            GdipBitmapUnlockBits(bmp, &bd);
-        }
-        GdipDisposeImage(bmp);
-    }
-    stm->lpVtbl->Release(stm);
-    return ok;
-}
-
-static const Image *get_image(int id)
-{
-    Image *im = &g_img[id];
-    if (!im->px && !decode_jpeg(id, im)) {
-        /* Decoder unavailable: fall back to a plain night gradient so the app stays usable. */
-        int x, y;
-        im->w = 96; im->h = 32;
-        im->px = (DWORD *)xalloc(sizeof(DWORD) * 96 * 32);
-        if (!im->px) return NULL;
-        for (y = 0; y < 32; y++) for (x = 0; x < 96; x++) im->px[y * 96 + x] = mix(0x0E1830, 0x3B5374, y * 8);
-    }
-    return im;
-}
-
-static void free_unused_images(void)
-{
-    BOOL used[13] = {0}; int i;
-    for (i = 0; i < 24; i++) used[g_sched[i]] = TRUE;
-    for (i = 1; i <= 12; i++) if (!used[i] && g_img[i].px) { xfree(g_img[i].px); g_img[i].px = NULL; }
-}
-
-/* ---------------------------------------------------------------- fonts */
-
-static HFONT mkfont(const WCHAR *face, int px, int weight, BOOL italic, BOOL underline)
-{
-    return CreateFontW(-dp(px), 0, 0, 0, weight, (DWORD)italic, (DWORD)underline, 0, DEFAULT_CHARSET,
-                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
-}
-
-static void fonts_free(void)
-{
-    int i;
-    for (i = 0; i < F_COUNT; i++) if (g_font[i]) { DeleteObject(g_font[i]); g_font[i] = NULL; }
-}
-
-static void fonts_make(void)
-{
-    TEXTMETRICW tm; HGDIOBJ old;
-    fonts_free();
-    g_font[F_BODY]   = mkfont(L"Segoe UI", 15, FW_NORMAL, FALSE, FALSE);
-    g_font[F_BOLD]   = mkfont(L"Segoe UI", 15, FW_BOLD, FALSE, FALSE);
-    g_font[F_ITALIC] = mkfont(L"Segoe UI", 15, FW_NORMAL, TRUE, FALSE);
-    g_font[F_UNDER]  = mkfont(L"Segoe UI", 15, FW_NORMAL, FALSE, TRUE);
-    g_font[F_TITLE]  = mkfont(L"Segoe UI Semibold", 18, FW_SEMIBOLD, FALSE, FALSE);
-    g_font[F_NAME]   = mkfont(L"Georgia", 34, FW_NORMAL, FALSE, FALSE);
-    g_font[F_LABEL]  = mkfont(L"Segoe UI Semibold", 12, FW_SEMIBOLD, FALSE, FALSE);
-    g_font[F_BTN]    = mkfont(L"Segoe UI Semibold", 14, FW_SEMIBOLD, FALSE, FALSE);
-    g_font[F_NUM]    = mkfont(L"Segoe UI", 11, FW_NORMAL, FALSE, FALSE);
-    g_font[F_NUMB]   = mkfont(L"Segoe UI", 11, FW_BOLD, FALSE, FALSE);
-    g_font[F_SMALL]  = mkfont(L"Segoe UI", 12, FW_NORMAL, FALSE, FALSE);
-    old = SelectObject(g_dc, g_font[F_BODY]);
-    GetTextMetricsW(g_dc, &tm); g_lineH = tm.tmHeight + tm.tmExternalLeading + dp(3);
-    SelectObject(g_dc, g_font[F_TITLE]);
-    GetTextMetricsW(g_dc, &tm); g_titleH = tm.tmHeight + tm.tmExternalLeading + dp(2);
-    SelectObject(g_dc, old);
-}
-
-static HFONT style_font(int s)
-{
-    static const BYTE map[S_COUNT] = { F_BODY, F_BOLD, F_ITALIC, F_UNDER, F_TITLE };
-    return g_font[map[s]];
-}
-
-/* ------------------------------------------------------ rich text layout */
-
-static void txt_add(const WCHAR *s, int style)
-{
-    while (*s && g_txtLen < TXT_MAX - 1) { g_txt[g_txtLen] = *s++; g_sty[g_txtLen++] = (BYTE)style; }
-}
-
-static void text_build(void)
-{
-    g_txtLen = 0;
-    if (g_has) {
-        const Event *e = &EVENTS[g_sched[g_cur]]; WCHAR t[96]; int i;
-        wsprintfW(t, L"Hour %d: Weather Event: %s\n\n", g_cur, e->name);
-        txt_add(t, S_TITLE);
-        for (i = 0; i < e->nruns; i++) txt_add(e->runs[i].text, e->runs[i].style);
-    } else {
-        txt_add(L"No weather rolled yet\n\n", S_TITLE);
-        txt_add(L"Press ", S_N); txt_add(L"New Day ", S_B);
-        txt_add(L"to roll twenty-four hours of weather for the Dale.\n", S_N);
-        txt_add(L"Then click an hour on the bar, or use the ", S_N); txt_add(L"Left ", S_B);
-        txt_add(L"and ", S_N); txt_add(L"Right ", S_B); txt_add(L"arrow keys, to step through the day.", S_N);
+    if (g.a.playing && !s_play_timer) {
+        g.play_last = GetTickCount64();
+        SetTimer(g.hwnd, T_PLAY, 250, NULL);
+        s_play_timer = true;
+    } else if (!g.a.playing && s_play_timer) {
+        KillTimer(g.hwnd, T_PLAY);
+        s_play_timer = false;
     }
 }
 
-static int txt_measure(int a, int b)
+static int cell_of_sel(void)
 {
-    int w = 0;
-    while (a < b) {
-        int e = a + 1; SIZE sz;
-        while (e < b && g_sty[e] == g_sty[a]) e++;
-        SelectObject(g_dc, style_font(g_sty[a]));
-        GetTextExtentPoint32W(g_dc, g_txt + a, e - a, &sz);
-        w += sz.cx; a = e;
-    }
-    return w;
-}
-
-static void txt_emit(int a, int b, int x, int y)
-{
-    while (b > a && g_txt[b - 1] == L' ') b--;
-    while (a < b && g_nfrag < FRAG_MAX) {
-        int e = a + 1; SIZE sz; Frag *f = &g_frag[g_nfrag++];
-        while (e < b && g_sty[e] == g_sty[a]) e++;
-        SelectObject(g_dc, style_font(g_sty[a]));
-        GetTextExtentPoint32W(g_dc, g_txt + a, e - a, &sz);
-        f->x = x; f->y = y; f->off = (unsigned short)a; f->len = (unsigned short)(e - a); f->style = g_sty[a];
-        x += sz.cx; a = e;
-    }
-}
-
-static int txt_trim(int a, int b) { while (b > a && g_txt[b - 1] == L' ') b--; return b; }
-
-/* Greedy word wrap of one logical line; continuation lines start at `hang`. */
-static void txt_wrap(int a, int b, int width, int indent, int hang, int lh, int *y)
-{
-    int p = a; BOOL first = TRUE;
-    while (p < b) {
-        int x0 = first ? indent : hang, avail = width - x0, best = -1, q = p;
-        if (txt_measure(p, txt_trim(p, b)) <= avail) { txt_emit(p, b, x0, *y); *y += lh; return; }
-        while (q < b) {
-            int e = q;
-            while (e < b && g_txt[e] != L' ') e++;
-            if (txt_measure(p, e) > avail) { if (best < 0) best = e; break; }   /* an over-long word stays whole */
-            best = e;
-            while (e < b && g_txt[e] == L' ') e++;
-            q = e;
-        }
-        if (best <= p) best = b;
-        txt_emit(p, best, x0, *y); *y += lh;
-        p = best;
-        while (p < b && g_txt[p] == L' ') p++;
-        first = FALSE;
-    }
-}
-
-static void text_layout(void)
-{
-    HGDIOBJ old = SelectObject(g_dc, g_font[F_BODY]);
-    int width = g_rcText.right - g_rcText.left - dp(10), pos = 0, y = 0;
-    if (width < dp(120)) width = dp(120);
-    g_nfrag = 0;
-    while (pos < g_txtLen) {
-        int b = pos;
-        while (b < g_txtLen && g_txt[b] != L'\n') b++;
-        if (b == pos) {
-            y += dp(9);                                        /* blank line: a small gap */
-        } else if (g_sty[pos] == S_TITLE) {
-            txt_wrap(pos, b, width, 0, 0, g_titleH, &y);
-        } else {
-            /* Leading spaces become a real indent; "a)", "ii)" and bullet markers get a hanging indent. */
-            int a = pos, lead = 0, indent, hang, e;
-            while (a < b && g_txt[a] == L' ') { a++; lead++; }
-            indent = lead * dp(6); hang = indent;
-            e = a;
-            while (e < b && g_txt[e] != L' ') e++;
-            if (e > a && e < b && (g_txt[e - 1] == L')' || (e - a == 1 && g_txt[a] == 0x25CF))) {
-                while (e < b && g_txt[e] == L' ') e++;
-                hang = indent + txt_measure(a, e);
-            }
-            if (hang > width / 2) hang = indent;
-            txt_wrap(a, b, width, indent, hang, g_lineH, &y);
-        }
-        pos = b + 1;
-    }
-    g_textH = y;
-    SelectObject(g_dc, old);
-}
-
-static int text_view_h(void) { int h = g_rcText.bottom - g_rcText.top; return h > 0 ? h : 0; }
-static int text_max_scroll(void) { int m = g_textH - text_view_h(); return m > 0 ? m : 0; }
-
-/* --------------------------------------------------------------- layout */
-
-static int cell_x(int i) { return g_rcBar.left + MulDiv(g_rcBar.right - g_rcBar.left, i, 24); }
-
-/* The content never gets wider than this: the scene pictures are 720 px wide and
-   must not be blown up into mush in a maximised window. Wider windows get margins. */
-static int column_w(int W) { int m = dp(960); return W < m ? W : m; }
-
-static void layout(void)
-{
-    int W = g_w, H = g_h, M = dp(24), CW = column_w(W), X0 = (W - CW) / 2, X1 = X0 + CW;
-    int sceneH = clampi(CW / 3, dp(150), dp(320)), strip = dp(62), bh = dp(36), by;
-    if (sceneH > H / 2) sceneH = H / 2;
-    SetRect(&g_rcScene, X0, 0, X1, sceneH);
-    SetRect(&g_rcBar, X0 + M, sceneH + dp(16), X1 - M, sceneH + dp(16) + dp(54));
-    g_numsTop = g_rcBar.bottom + dp(6);
-    SetRect(&g_rcBarZone, 0, sceneH, W, g_numsTop + dp(16) + dp(8));
-    SetRect(&g_rcBtnZone, 0, H - strip, W, H);
-    SetRect(&g_rcTextZone, 0, g_rcBarZone.bottom, W, g_rcBtnZone.top);
-    SetRect(&g_rcText, X0 + dp(28), g_rcTextZone.top + dp(6), X1 - dp(22), g_rcTextZone.bottom - dp(8));
-    by = g_rcBtnZone.top + (strip - bh) / 2;
-    SetRect(&g_rcBtn[BTN_NEW], X0 + M, by, X0 + M + dp(128), by + bh);
-    SetRect(&g_rcBtn[BTN_NEXT], X1 - M - dp(128), by, X1 - M, by + bh);
-    SetRect(&g_rcBtn[BTN_PREV], g_rcBtn[BTN_NEXT].left - dp(10) - dp(148), by, g_rcBtn[BTN_NEXT].left - dp(10), by + bh);
-}
-
-/* Fixed (non-text) vertical space of the layout for a given client width. */
-static int chrome_height(int W)
-{
-    return clampi(column_w(W) / 3, dp(150), dp(320)) + dp(16) + dp(54) + dp(6) + dp(16) + dp(8) + dp(6) + dp(8) + dp(62);
-}
-
-/* Like the Python adjust_window_size(): if the description does not fit, grow the
-   window (never past the monitor work area). Beyond that the wheel scrolls. */
-static void ensure_fit(void)
-{
-    int need = g_textH - text_view_h();
-    RECT wr; MONITORINFO mi; int h, maxH, top;
-    if (need <= 0 || !g_hwnd || IsZoomed(g_hwnd) || IsIconic(g_hwnd)) return;
-    mi.cbSize = sizeof(mi);
-    if (!GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
-    GetWindowRect(g_hwnd, &wr);
-    h = wr.bottom - wr.top; maxH = mi.rcWork.bottom - mi.rcWork.top;
-    if (h >= maxH) return;
-    h = h + need > maxH ? maxH : h + need;
-    top = wr.top;
-    if (top + h > mi.rcWork.bottom) top = mi.rcWork.bottom - h;
-    if (top < mi.rcWork.top) top = mi.rcWork.top;
-    SetWindowPos(g_hwnd, NULL, wr.left, top, wr.right - wr.left, h, SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-/* ------------------------------------------------------------- painting */
-
-static void text_out(int x, int y, const WCHAR *s, int n, DWORD c)
-{
-    SetTextColor(g_dc, RGB_OF(c));
-    TextOutW(g_dc, x, y, s, n);
-}
-
-static void text_shadowed(int x, int y, const WCHAR *s, int n, DWORD c)
-{
-    int o = dp(1) > 0 ? dp(1) : 1;
-    text_out(x + o, y + o, s, n, C_SHADOW);
-    text_out(x, y, s, n, c);
-}
-
-static void scene_cache(int event, BOOL dim)
-{
-    int w = g_rcScene.right - g_rcScene.left, h = g_rcScene.bottom, x, y;
-    BOOL edges = w < g_w;                                     /* margins beside the picture */
-    int key = event | (dim ? 64 : 0) | (edges ? 128 : 0);
-    const Image *im;
-    if (g_scenePx && g_sceneW == w && g_sceneH == h && g_sceneKey == key) return;
-    if (!g_scenePx || g_sceneW != w || g_sceneH != h) {
-        xfree(g_scenePx);
-        g_scenePx = (DWORD *)xalloc(sizeof(DWORD) * (SIZE_T)w * h);
-        g_sceneW = w; g_sceneH = h;
-    }
-    g_sceneKey = -1;
-    if (!g_scenePx || !(im = get_image(event))) return;
-    resample_cover(im, g_scenePx, w, h, w);
-    /* Melt the lower part of the picture into the window background. */
-    for (y = 0; y < h; y++) {
-        DWORD *p = g_scenePx + (SIZE_T)y * w;
-        int t = (y * 1024 / h - 380) * 1024 / 644, a;
-        t = clampi(t, 0, 1024);
-        a = (t * t / 1024) * (3072 - 2 * t) / 1024;          /* smoothstep, 0..1024 */
-        a = a * 250 / 1024;
-        if (dim) a = 120 + a * (256 - 120) / 256;
-        if (a > 0) for (x = 0; x < w; x++) p[x] = mix(p[x], C_BG, a);
-    }
-    if (edges) {                                              /* and its sides into the margins */
-        int f = dp(72);
-        if (f > w / 3) f = w / 3;
-        for (x = 0; x < f; x++) {
-            int t = x * 1024 / f, a = 256 - ((t * t / 1024) * (3072 - 2 * t) / 1024) / 4;
-            for (y = 0; y < h; y++) {
-                DWORD *p = g_scenePx + (SIZE_T)y * w;
-                p[x] = mix(p[x], C_BG, a); p[w - 1 - x] = mix(p[w - 1 - x], C_BG, a);
-            }
-        }
-    }
-    g_sceneKey = key;
-}
-
-static void draw_scene(void)
-{
-    int x0 = g_rcScene.left, w = g_rcScene.right - x0, h = g_rcScene.bottom, y, M = dp(24);
-    HGDIOBJ old; SIZE sz; WCHAR buf[96]; int n, nameY, labelY;
-    if (h <= 0 || w <= 0) return;
-    scene_cache(g_has ? g_sched[g_cur] : 1, !g_has);
-    GdiFlush();
-    if (x0 > 0) px_fill(0, 0, x0, h, C_BG);
-    if (x0 + w < g_w) px_fill(x0 + w, 0, g_w, h, C_BG);
-    if (g_scenePx && g_sceneKey >= 0)
-        for (y = 0; y < h; y++) memcpy(g_px + (SIZE_T)y * g_w + x0, g_scenePx + (SIZE_T)y * w, sizeof(DWORD) * w);
-    else
-        px_fill(x0, 0, x0 + w, h, C_BG_SOFT);
-
-    old = SelectObject(g_dc, g_font[F_NAME]);
-    SetBkMode(g_dc, TRANSPARENT);
-    {
-        const WCHAR *name = g_has ? EVENTS[g_sched[g_cur]].name : L"Press New Day to roll the weather";
-        int len = lstrlenW(name);
-        if (!g_has) SelectObject(g_dc, g_font[F_TITLE]);
-        GetTextExtentPoint32W(g_dc, name, len, &sz);
-        nameY = h - dp(12) - sz.cy;
-        text_shadowed(x0 + M - dp(1), nameY, name, len, C_BRIGHT);
-    }
-    SelectObject(g_dc, g_font[F_LABEL]);
-    SetTextCharacterExtra(g_dc, dp(2));
-    n = g_has ? wsprintfW(buf, L"HOUR %d", g_cur) : wsprintfW(buf, L"ICEWIND DALE");
-    GetTextExtentPoint32W(g_dc, buf, n, &sz);
-    labelY = nameY - sz.cy - dp(1);
-    text_shadowed(x0 + M, labelY, buf, n, C_TITLE);
-    SetTextCharacterExtra(g_dc, 0);
-    if (g_has) {
-        /* Extent of the current stretch of weather, right-aligned. */
-        int s = g_cur, e = g_cur;
-        while (s > 0 && g_sched[s - 1] == g_sched[g_cur]) s--;
-        while (e < 23 && g_sched[e + 1] == g_sched[g_cur]) e++;
-        SelectObject(g_dc, g_font[F_SMALL]);
-        if (s == e) n = wsprintfW(buf, L"1 hour  ·  hour %d only", s);
-        else        n = wsprintfW(buf, L"%d hours  ·  hour %d to %d", e - s + 1, s, e);
-        GetTextExtentPoint32W(g_dc, buf, n, &sz);
-        if (sz.cx < w / 2 - M) text_shadowed(x0 + w - M - sz.cx, h - dp(17) - sz.cy, buf, n, C_TEXT);
-    }
-    SelectObject(g_dc, old);
-}
-
-static void bar_cache(void)
-{
-    int w = g_rcBar.right - g_rcBar.left, h = g_rcBar.bottom - g_rcBar.top, s, x, y;
-    if (g_barValid && g_barPx && g_barW == w && g_barH == h) return;
-    if (!g_barPx || g_barW != w || g_barH != h) {
-        xfree(g_barPx);
-        g_barPx = (DWORD *)xalloc(sizeof(DWORD) * (SIZE_T)w * h);
-        g_barW = w; g_barH = h;
-    }
-    g_barValid = FALSE;
-    if (!g_barPx || w <= 0 || h <= 0) return;
-    for (s = 0; s < 24; ) {
-        /* A run of k equal hours is one continuous k-cell-wide crop of that scene. */
-        int e = s, x0, x1; const Image *im;
-        while (e < 23 && g_sched[e + 1] == g_sched[s]) e++;
-        x0 = cell_x(s) - g_rcBar.left; x1 = cell_x(e + 1) - g_rcBar.left;
-        im = get_image(g_sched[s]);
-        if (im && x1 > x0) resample_cover(im, g_barPx + x0, x1 - x0, h, w);
-        for (x = s + 1; x <= e; x++) {                        /* faint hour ticks inside a run */
-            int cx = cell_x(x) - g_rcBar.left;
-            for (y = 0; y < h; y++) { DWORD *p = g_barPx + (SIZE_T)y * w + cx; *p = mix(*p, C_BG, 70); }
-        }
-        if (e < 23) {                                         /* separator between different events */
-            int cx = x1 - 1, t = dp(2) > 1 ? dp(2) : 2, i;
-            for (i = 0; i < t; i++) if (cx + i >= 0 && cx + i < w)
-                for (y = 0; y < h; y++) g_barPx[(SIZE_T)y * w + cx + i] = C_BG;
-        }
-        s = e + 1;
-    }
-    for (x = 0; x < w; x++) {                                 /* soft top light / bottom shade */
-        DWORD *p = g_barPx + x;
-        if (*p != C_BG) *p = mix(*p, 0xFFFFFF, 34);
-        p = g_barPx + (SIZE_T)(h - 1) * w + x;
-        if (*p != C_BG) *p = mix(*p, 0x000000, 70);
-    }
-    g_barValid = TRUE;
-}
-
-static void draw_bar(void)
-{
-    RECT z = g_rcBarZone, b = g_rcBar; int w = b.right - b.left, h = b.bottom - b.top, i, y;
-    HGDIOBJ old;
-    GdiFlush();
-    px_fill(z.left, z.top, z.right, z.bottom, C_BG);
-    if (w <= 0 || h <= 0) return;
-    px_frame(b.left - 1, b.top - 1, b.right + 1, b.bottom + 1, 1, C_FRAME);
-    if (g_has) {
-        bar_cache();
-        if (g_barValid && b.right <= g_w && b.bottom <= g_h)
-            for (y = 0; y < h; y++) memcpy(g_px + (SIZE_T)(b.top + y) * g_w + b.left, g_barPx + (SIZE_T)y * w, sizeof(DWORD) * w);
-        for (i = 0; i < 24; i++) {
-            int x0 = cell_x(i), x1 = cell_x(i + 1);
-            if (i == g_cur) continue;
-            if (i == g_hoverCell) px_blend(x0, b.top, x1, b.bottom, 0xFFFFFF, 26);
-            else                  px_blend(x0, b.top, x1, b.bottom, C_BG, 72);   /* the current hour stays lit */
-        }
-        {   /* current hour: dark-light-dark frame (reads on snow and on night alike) + marker */
-            int x0 = cell_x(g_cur), x1 = cell_x(g_cur + 1), t = dp(2) > 1 ? dp(2) : 2, m = dp(5), cx = (x0 + x1) / 2, r;
-            px_frame(x0 - t - 1, b.top - t - 1, x1 + t + 1, b.bottom + t + 1, 1, C_SHADOW);
-            px_frame(x0 - t, b.top - t, x1 + t, b.bottom + t, t, C_ICE);
-            px_frame(x0, b.top, x1, b.bottom, 1, C_SHADOW);
-            for (r = 0; r < m; r++)                           /* small downward marker above the cell */
-                px_fill(cx - (m - 1 - r), b.top - t - dp(3) - m + r, cx + (m - r), b.top - t - dp(3) - m + r + 1, C_ICE);
-        }
-    } else {
-        px_fill(b.left, b.top, b.right, b.bottom, C_BG_SOFT);
-        for (i = 1; i < 24; i++) px_fill(cell_x(i), b.top, cell_x(i) + 1, b.bottom, C_LINE);
-    }
-    old = SelectObject(g_dc, g_font[F_NUM]);
-    SetBkMode(g_dc, TRANSPARENT);
-    for (i = 0; i < 24; i++) {
-        WCHAR t[4]; SIZE sz; int n = wsprintfW(t, L"%d", i), cx = (cell_x(i) + cell_x(i + 1)) / 2;
-        BOOL cur = g_has && i == g_cur;
-        SelectObject(g_dc, g_font[cur ? F_NUMB : F_NUM]);
-        GetTextExtentPoint32W(g_dc, t, n, &sz);
-        text_out(cx - sz.cx / 2, g_numsTop, t, n, cur ? C_BRIGHT : (g_has && i == g_hoverCell) ? C_TEXT : C_DIM);
-    }
-    SelectObject(g_dc, old);
-}
-
-static void draw_text(void)
-{
-    static const DWORD col[S_COUNT] = { C_TEXT, C_BRIGHT, C_ITALIC, C_TEXT, C_TITLE };
-    RECT z = g_rcTextZone, r = g_rcText; int i, vh = text_view_h(), maxs = text_max_scroll(), saved;
-    HGDIOBJ old;
-    GdiFlush();
-    px_fill(z.left, z.top, z.right, z.bottom, C_BG);
-    if (vh <= 0) return;
-    saved = SaveDC(g_dc);
-    IntersectClipRect(g_dc, r.left, r.top, r.right, r.bottom);
-    SetBkMode(g_dc, TRANSPARENT);
-    old = SelectObject(g_dc, g_font[F_BODY]);
-    for (i = 0; i < g_nfrag; i++) {
-        const Frag *f = &g_frag[i]; int y = f->y - g_scroll;
-        if (y > vh || y + g_titleH + g_lineH < 0) continue;
-        SelectObject(g_dc, style_font(f->style));
-        text_out(r.left + f->x, r.top + y, g_txt + f->off, f->len, col[f->style]);
-    }
-    SelectObject(g_dc, old);
-    RestoreDC(g_dc, saved);
-    if (maxs > 0) {                                           /* soft edges where text continues + slim scroll indicator */
-        int tw = dp(3), x = r.right + dp(12), th = vh * vh / g_textH, ty, fade = dp(14), k;
-        GdiFlush();
-        for (k = 0; k < fade && fade > 0; k++) {
-            int a = 256 - (k + 1) * 256 / (fade + 1);
-            if (g_scroll > 0)    px_blend(r.left, r.top + k, r.right, r.top + k + 1, C_BG, a);
-            if (g_scroll < maxs) px_blend(r.left, r.bottom - 1 - k, r.right, r.bottom - k, C_BG, a);
-        }
-        if (th < dp(24)) th = dp(24);
-        if (th > vh) th = vh;
-        ty = r.top + MulDiv(vh - th, g_scroll, maxs);
-        px_fill(x, r.top, x + tw, r.bottom, C_BG_SOFT);
-        px_fill(x, ty, x + tw, ty + th, 0x4C6485);
-    }
-}
-
-static BOOL btn_enabled(int i) { return i == BTN_NEW || g_has; }
-
-static void draw_buttons(void)
-{
-    static const WCHAR *label[BTN_COUNT] = { L"New Day", L"‹   Previous hour", L"Next hour   ›" };
-    RECT z = g_rcBtnZone; int i; HGDIOBJ old;
-    GdiFlush();
-    px_fill(z.left, z.top, z.right, z.bottom, C_BG);
-    px_fill(z.left, z.top, z.right, z.top + 1, C_LINE);
-    for (i = 0; i < BTN_COUNT; i++) {
-        RECT r = g_rcBtn[i];
-        BOOL en = btn_enabled(i), hov = en && g_hoverBtn == i && (g_pressBtn < 0 || g_pressBtn == i);
-        BOOL down = en && g_pressBtn == i && g_hoverBtn == i;
-        DWORD top, bot, border;
-        if (i == BTN_NEW) {
-            top = down ? 0x1A3F69 : hov ? 0x3A7DBD : 0x2F6AA3; bot = down ? 0x245688 : hov ? 0x245A8E : 0x1C4472;
-            border = hov ? 0xB5DCF7 : 0x7FBDEB;
-        } else if (!en) {
-            top = bot = 0x101722; border = 0x1D2838;
-        } else {
-            top = down ? 0x111925 : hov ? 0x26364E : 0x1B2638; bot = down ? 0x1A2538 : hov ? 0x1A2639 : 0x131B29;
-            border = hov ? 0x6C8BB0 : 0x35465F;
-        }
-        px_vgrad(r.left, r.top, r.right, r.bottom, top, bot);
-        px_frame(r.left, r.top, r.right, r.bottom, 1, border);
-        if (en && !down) px_blend(r.left + 1, r.top + 1, r.right - 1, r.top + 2, 0xFFFFFF, 34);
-        px_fill(r.left, r.top, r.left + 1, r.top + 1, C_BG);       px_fill(r.right - 1, r.top, r.right, r.top + 1, C_BG);
-        px_fill(r.left, r.bottom - 1, r.left + 1, r.bottom, C_BG); px_fill(r.right - 1, r.bottom - 1, r.right, r.bottom, C_BG);
-        if (g_focusBtn == i) px_frame(r.left - dp(3), r.top - dp(3), r.right + dp(3), r.bottom + dp(3), dp(1) > 0 ? dp(1) : 1, C_ICE);
-    }
-    old = SelectObject(g_dc, g_font[F_BTN]);
-    SetBkMode(g_dc, TRANSPARENT);
-    for (i = 0; i < BTN_COUNT; i++) {
-        RECT r = g_rcBtn[i]; SIZE sz; int n = lstrlenW(label[i]);
-        BOOL en = btn_enabled(i), down = en && g_pressBtn == i && g_hoverBtn == i;
-        GetTextExtentPoint32W(g_dc, label[i], n, &sz);
-        text_out((r.left + r.right - sz.cx) / 2, (r.top + r.bottom - sz.cy) / 2 - dp(1) + (down ? 1 : 0), label[i], n,
-                 !en ? 0x475468 : i == BTN_NEW ? C_BRIGHT : (g_hoverBtn == i ? C_BRIGHT : C_TEXT));
-    }
-    {   /* key hint between the buttons, only when there is room for it */
-        static const WCHAR hint[] = L"← →  hour     N  new day";
-        SIZE sz; int n = (int)(sizeof(hint) / sizeof(hint[0])) - 1;
-        int l = g_rcBtn[BTN_NEW].right + dp(16), r = g_rcBtn[BTN_PREV].left - dp(16);
-        SelectObject(g_dc, g_font[F_SMALL]);
-        GetTextExtentPoint32W(g_dc, hint, n, &sz);
-        if (sz.cx <= r - l) text_out(l, (g_rcBtn[BTN_NEW].top + g_rcBtn[BTN_NEW].bottom - sz.cy) / 2, hint, n, 0x53627A);
-    }
-    SelectObject(g_dc, old);
-}
-
-static void render(void)
-{
-    if (!g_px) return;
-    if (g_dirty & D_SCENE) draw_scene();
-    if (g_dirty & D_BAR)   draw_bar();
-    if (g_dirty & D_TEXT)  draw_text();
-    if (g_dirty & D_BTN)   draw_buttons();
-    g_dirty = 0;
-    GdiFlush();
-}
-
-static void mark(unsigned what)
-{
-    g_dirty |= what;
-    if (!g_hwnd) return;
-    if (what & D_SCENE) InvalidateRect(g_hwnd, &g_rcScene, FALSE);
-    if (what & D_BAR)   InvalidateRect(g_hwnd, &g_rcBarZone, FALSE);
-    if (what & D_TEXT)  InvalidateRect(g_hwnd, &g_rcTextZone, FALSE);
-    if (what & D_BTN)   InvalidateRect(g_hwnd, &g_rcBtnZone, FALSE);
-}
-
-/* ------------------------------------------------------------ back buffer */
-
-static void backbuffer_resize(int w, int h)
-{
-    BITMAPINFO bi; HBITMAP bmp; void *bits = NULL;
-    if (w == g_w && h == g_h && g_bmp) return;
-    if (g_bmp) { SelectObject(g_dc, g_bmpOld); DeleteObject(g_bmp); g_bmp = NULL; g_px = NULL; }
-    g_w = w; g_h = h;
-    if (w <= 0 || h <= 0) return;
-    ZeroMemory(&bi, sizeof(bi));
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;       /* top-down */
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    bmp = CreateDIBSection(g_dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!bmp) return;
-    g_bmp = bmp; g_px = (DWORD *)bits;
-    g_bmpOld = (HBITMAP)SelectObject(g_dc, bmp);
-}
-
-/* ------------------------------------------------------------- actions */
-
-static void refresh_text(BOOL fit)
-{
-    text_build();
-    text_layout();
-    g_scroll = 0;
-    if (fit) ensure_fit();                                     /* may resize -> WM_SIZE -> relayout */
-}
-
-static void set_hour(int h)
-{
-    if (!g_has) return;
-    h = clampi(h, 0, 23);
-    if (h == g_cur) return;
-    g_cur = h;
-    refresh_text(TRUE);
-    mark(D_SCENE | D_BAR | D_TEXT);
-}
-
-static void do_new_day(void)
-{
-    new_day();
-    free_unused_images();
-    g_barValid = FALSE;
-    refresh_text(TRUE);
-    mark(D_ALL);
-}
-
-static void scroll_to(int s)
-{
-    s = clampi(s, 0, text_max_scroll());
-    if (s != g_scroll) { g_scroll = s; mark(D_TEXT); }
-}
-
-static int hit_btn(int x, int y)
-{
-    POINT p; int i;
-    p.x = x; p.y = y;
-    for (i = 0; i < BTN_COUNT; i++) if (PtInRect(&g_rcBtn[i], p)) return i;
+    AlmCell c[32]; int n = view_cells(c), i;
+    for (i = 0; i < n; i++) if (c[i].abs == g.a.sel_abs) return i;
     return -1;
 }
 
-static int hit_cell(int x, int y)
+/* after any state change: day-bound UI (notes EDIT, new-event form, armed delete), the
+ * playback timer and the wind */
+static void state_sync(void)
 {
-    int w = g_rcBar.right - g_rcBar.left;
-    if (!g_has || w <= 0 || x < g_rcBar.left || x >= g_rcBar.right) return -1;
-    if (y < g_rcBar.top - dp(6) || y >= g_numsTop + dp(16)) return -1;
-    return clampi((x - g_rcBar.left) * 24 / w, 0, 23);
-}
-
-static void set_hover(int cell, int btn)
-{
-    if (cell != g_hoverCell) { g_hoverCell = cell; mark(D_BAR); }
-    if (btn != g_hoverBtn)   { g_hoverBtn = btn;   mark(D_BTN); }
-}
-
-static void press_button(int i)
-{
-    if (i == BTN_NEW) do_new_day();
-    else if (g_has) set_hour((g_cur + (i == BTN_NEXT ? 1 : 23)) % 24);
-}
-
-/* Tab / Shift+Tab walk a keyboard focus ring over the enabled buttons. */
-static void focus_step(int dir)
-{
-    int i = g_focusBtn, k;
-    for (k = 0; k < BTN_COUNT; k++) {
-        i = i < 0 ? (dir > 0 ? 0 : BTN_COUNT - 1) : (i + dir + BTN_COUNT) % BTN_COUNT;
-        if (btn_enabled(i)) break;
+    if (g.a.sel_abs != s_last_sel) {
+        s_last_sel = g.a.sel_abs;
+        if (g.ed_notes && g.notes_abs != g.a.sel_abs) {
+            if (g.note_pending) ui_notes_flush();
+            notes_drop();
+        }
+        if (g.notes_abs != g.a.sel_abs) g.note_state = 0;
+        if (g.form_open && !g.form_id[0]) ui_close_form();
+        if (g.armed_id[0]) { g.armed_id[0] = 0; KillTimer(g.hwnd, T_ARM); }
+        if (g.grid_focus) { int k = cell_of_sel(); if (k >= 0) g.grid_k = k; }
     }
-    if (i != g_focusBtn) { g_focusBtn = i; mark(D_BTN); }
+    play_sync();
+    wind_sync(false);
 }
 
-/* Ctrl+C: the description shown on screen, as plain text. */
-static void copy_text(HWND hwnd)
+void ui_apply(AlmResult r)
 {
-    HGLOBAL hg; WCHAR *d; int i, n = 0;
-    for (i = 0; i < g_txtLen; i++) n += g_txt[i] == L'\n' ? 2 : 1;
-    if (!n || !OpenClipboard(hwnd)) return;
-    hg = GlobalAlloc(GMEM_MOVEABLE, sizeof(WCHAR) * ((SIZE_T)n + 1));
-    d = hg ? (WCHAR *)GlobalLock(hg) : NULL;
-    if (d) {
-        for (i = 0; i < g_txtLen; i++) { if (g_txt[i] == L'\n') *d++ = L'\r'; *d++ = g_txt[i]; }
-        *d = 0;
-        GlobalUnlock(hg);
-        EmptyClipboard();
-        if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
-    } else if (hg) GlobalFree(hg);
-    CloseClipboard();
+    unsigned fx = r.fx;
+    if (fx & ALM_FX_STOP_BECKON) g.beckon = false;
+    if (fx & ALM_FX_BECKON) g.beckon = true;
+    if (fx & ALM_FX_DAY_TOAST) day_toast(r.toast_abs, r.toast_lead);
+    if (fx & ALM_FX_TOAST) ui_toast(r.toast);
+    if (fx & ALM_FX_RENDER_DAY) view_invalidate_timeline();
+    if (fx & (ALM_FX_RENDER_DAY | ALM_FX_RENDER_CAL | ALM_FX_TOAST | ALM_FX_DAY_TOAST)) g.rev++;
+    state_sync();
+    if (fx & ALM_FX_SAVE) { if (s_durable > 0) ui_save_now(); else save_soon(); }
+    title_sync();
+    if (fx & ALM_FX_RENDER_ALL) ui_relayout();
+    else if (fx & (ALM_FX_TOAST | ALM_FX_DAY_TOAST | ALM_FX_BECKON | ALM_FX_STOP_BECKON)) ui_redraw();
 }
 
-/* --------------------------------------------------------- window proc */
+
+/* ================================================================== actions */
+
+/* Every user action goes through ACT(call): the state before the call decides the
+ * party clock, the undo slot and the "today moved" toast afterwards. */
+typedef struct Pre {
+    bool    was_today;      /* the party's day was on screen */
+    double  t0;             /* clock before the action */
+    int32_t cur0, cur_abs0;
+    double  party0;         /* the party's clock (today's time, wherever the view is) */
+    bool    keep_clock;     /* hour stepping: never jump the clock back to the party's */
+} Pre;
+
+static double party_clock(void)
+{
+    if (g.a.view == g.a.current || g.party_time < 0) return g.a.time;
+    return g.party_time;
+}
+
+static void pre_capture(Pre *p, bool keep_clock)
+{
+    p->was_today = g.a.current >= 0 && g.a.view == g.a.current;
+    p->t0 = g.a.time;
+    p->cur0 = g.a.current;
+    p->cur_abs0 = g.a.current_abs;
+    p->party0 = party_clock();
+    p->keep_clock = keep_clock;
+}
+
+/* the toast that confirms a move of "today" and offers the undo */
+static void today_moved_toast(const Pre *p, AlmResult *r)
+{
+    char d[IWD_DATE_CAP], t[ALM_TOAST_CAP];
+    iwd_format_date(g.a.current_abs, false, d, sizeof d);
+    if (p->cur0 < 0) {                                   /* the very first dawn: no undo */
+        if (!(r->fx & (ALM_FX_DAY_TOAST | ALM_FX_TOAST))) {
+            snprintf(t, sizeof t, "The expedition begins on <b>%s</b>", d);
+            lstrcpynA(r->toast, t, ALM_TOAST_CAP);
+            r->fx |= ALM_FX_TOAST;
+        }
+        return;
+    }
+    if (r->fx & ALM_FX_DAY_TOAST) return;               /* hint added after ui_apply */
+    if (r->fx & ALM_FX_TOAST) {
+        size_t n = strlen(r->toast);
+        if (n + 32 < ALM_TOAST_CAP) lstrcatA(r->toast, " \xC2\xB7 Ctrl+Z steps back");
+        return;
+    }
+    snprintf(t, sizeof t, "Advanced to <b>%s</b> \xC2\xB7 Ctrl+Z steps back", d);
+    lstrcpynA(r->toast, t, ALM_TOAST_CAP);
+    r->fx |= ALM_FX_TOAST;
+}
+
+static void post_apply(const Pre *p, AlmResult r)
+{
+    bool moved;
+    if (r.fx & ALM_FX_REJECTED) { ui_apply(r); return; }
+    moved = g.a.current != p->cur0;
+    if (moved) {
+        g.party_time = -1;
+        if (p->cur0 >= 0) {
+            s_undo.ok = true; s_undo.cur_abs = p->cur_abs0; s_undo.time = p->party0;
+        }
+        today_moved_toast(p, &r);
+        if (p->cur0 == 0 && g.a.current == 1 && !g.a.ui.chain_note_hidden) {
+            AlmResult h = alm_hide_chain_note(&g.a);       /* the note has done its job */
+            r.fx |= h.fx & ~(unsigned)(ALM_FX_TOAST | ALM_FX_DAY_TOAST);
+        }
+        ui_apply(r);
+        if ((r.fx & ALM_FX_DAY_TOAST) && p->cur0 >= 0 && g.toast_on && g.toast_day)
+            lstrcpynA(g.toast_hint, "Ctrl+Z steps back to the previous day", (int)sizeof g.toast_hint);
+        return;
+    }
+    if (p->was_today && g.a.view != g.a.current) {
+        g.party_time = p->t0;                              /* leaving today: keep its clock */
+    } else if (!p->was_today && g.a.current >= 0 && g.a.view == g.a.current) {
+        if (g.party_time >= 0 && !p->keep_clock) {
+            AlmResult t = alm_set_time(&g.a, g.party_time, true);
+            if (!(t.fx & ALM_FX_REJECTED)) r.fx |= t.fx;
+        }
+        g.party_time = -1;
+    }
+    ui_apply(r);
+}
+
+#define ACT(call)  do { Pre p_; pre_capture(&p_, false); post_apply(&p_, (call)); } while (0)
+#define ACTH(call) do { Pre p_; pre_capture(&p_, true);  post_apply(&p_, (call)); } while (0)
+
+/* the live weather is at the top of the page: time-changing actions go back there */
+static void to_weather(void)
+{
+    if (g.scroll > 0) view_scroll_to(0);
+}
+
+static void stop_fade(void)
+{
+    if (g.fade_k) { g.fade_k = 0; KillTimer(g.hwnd, T_FADE); ui_redraw(); }
+}
+
+void ui_fade_start(void)
+{
+    if (g.hwnd && g.fade_k > 0) SetTimer(g.hwnd, T_FADE, 30, NULL);
+}
+
+static void do_advance(void)
+{
+    ui_notes_flush();
+    g.fade_req = true;
+    ACT(alm_advance(&g.a, IWD_SETTLE_HOUR));
+}
+
+static void do_step_hour(int dir)
+{
+    ui_notes_flush();
+    g.fade_req = true;
+    ACTH(alm_step_hour(&g.a, dir));
+}
+
+static void do_set_hour(int h)
+{
+    if (!alm_has_view(&g.a)) return;
+    g.fade_req = true;
+    ACTH(alm_set_time(&g.a, (double)h, true));
+}
+
+static void do_step_day(int dir)
+{
+    ui_notes_flush();
+    g.fade_req = true;
+    ACT(alm_step_day(&g.a, dir));
+}
+
+static void do_today(void)
+{
+    ui_notes_flush();
+    g.fade_req = true;
+    ACT(alm_cal_today(&g.a));
+}
+
+static void do_set_current(int32_t abs)
+{
+    ui_notes_flush();
+    g.fade_req = true;
+    DURABLE(ACT(alm_set_current(&g.a, abs)));
+}
+
+static void do_undo(void)
+{
+    AlmResult r, t;
+    char d[IWD_DATE_CAP], ck[16], msg[ALM_TOAST_CAP];
+    if (!s_undo.ok) { ui_toast("Nothing to step back to"); return; }
+    s_undo.ok = false;
+    ui_notes_flush();
+    r = alm_set_current(&g.a, s_undo.cur_abs);
+    if (r.fx & ALM_FX_REJECTED) { ui_apply(r); return; }
+    r.fx &= ~(unsigned)(ALM_FX_TOAST | ALM_FX_DAY_TOAST);
+    t = alm_set_time(&g.a, s_undo.time, true);
+    if (!(t.fx & ALM_FX_REJECTED)) r.fx |= t.fx;
+    g.party_time = -1;
+    g.fade_req = true;
+    iwd_format_date(g.a.current_abs, true, d, sizeof d);
+    iwd_fmt_clock(g.a.time, ck, sizeof ck);
+    snprintf(msg, sizeof msg, "Back to <b>%s</b>, %s", d, ck);
+    lstrcpynA(r.toast, msg, ALM_TOAST_CAP);
+    r.fx |= ALM_FX_TOAST | ALM_FX_RENDER_ALL | ALM_FX_SAVE;
+    ui_apply_durable(r);
+    to_weather();
+}
+
+static void copy_seed(void)
+{
+    WCHAR *w; HGLOBAL hg; size_t n;
+    if (!g.a.seed || !OpenClipboard(g.hwnd)) return;
+    w = wz_dup(g.a.seed);
+    if (!w) { CloseClipboard(); return; }
+    n = wcslen(w);
+    hg = GlobalAlloc(GMEM_MOVEABLE, (n + 1) * sizeof(WCHAR));
+    if (hg) {
+        WCHAR *d = (WCHAR *)GlobalLock(hg);
+        if (d) {
+            memcpy(d, w, (n + 1) * sizeof(WCHAR));
+            GlobalUnlock(hg);
+            EmptyClipboard();
+            if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
+        } else GlobalFree(hg);
+    }
+    CloseClipboard();
+    free(w);
+    {
+        char t[ALM_TOAST_CAP];
+        snprintf(t, sizeof t, "Seed <b>%.200s</b> copied to the clipboard", g.a.seed);
+        ui_toast(t);
+    }
+}
+
+static int32_t cell_abs(int arg, bool *ok)
+{
+    AlmCell c[32]; int n = view_cells(c);
+    *ok = true;
+    if (arg >= 0 && arg < n) return c[arg].abs;
+    *ok = false;
+    return 0;
+}
+
+static void ev_action(int id, int arg)
+{
+    AlmMark mk[64]; int n = alm_marks_on(&g.a, g.a.sel_abs, mk, 64);
+    const AlmEvent *ev;
+    if (n > 64) n = 64;
+    if (arg < 0 || arg >= n || mk[arg].builtin || !mk[arg].event) return;
+    ev = mk[arg].event;
+    if (id == H_EV_EDIT) { ui_open_form(ev); return; }
+    if (g.armed_id[0] && ev->id && strcmp(g.armed_id, ev->id) == 0) {
+        char idc[64];
+        lstrcpynA(idc, ev->id, (int)sizeof idc);
+        g.armed_id[0] = 0;
+        KillTimer(g.hwnd, T_ARM);
+        if (g.form_open && strcmp(g.form_id, idc) == 0) ui_close_form();
+        DURABLE(ACT(alm_event_delete(&g.a, idc)));
+    } else {
+        lstrcpynA(g.armed_id, ev->id ? ev->id : "", (int)sizeof g.armed_id);
+        SetTimer(g.hwnd, T_ARM, ALM_DELETE_ARM_MS, NULL);
+        ui_redraw();
+    }
+}
+
+static void form_repeat_popup(const RECT *hr)
+{
+    const char *lab[IWD_REPEAT_COUNT]; int i, k; POINT p;
+    for (i = 0; i < IWD_REPEAT_COUNT; i++) lab[i] = iwd_repeat_label((IwdRepeat)i);
+    p.x = hr->left; p.y = hr->bottom + dp(2);
+    ClientToScreen(g.hwnd, &p);
+    k = ui_popup_choice(g.hwnd, p.x, p.y, hr->right - hr->left, lab, IWD_REPEAT_COUNT, g.form_repeat);
+    if (k >= 0) { g.form_repeat = k; ui_redraw(); }
+}
+
+/* shortcut entry points (E, O, right-click): remember where the DM was */
+static void open_form_shortcut(void)
+{
+    if (g.saved_scroll < 0) g.saved_scroll = g.scroll;
+    ui_open_form(NULL);
+}
+
+static void notes_shortcut(void)
+{
+    if (!alm_has_view(&g.a) && g.a.sel_abs == INT32_MIN) return;
+    if (g.saved_scroll < 0) g.saved_scroll = g.scroll;
+    ui_notes_begin();
+    {
+        RECT r = view_block_rect(BLK_DAY);
+        if (!IsRectEmpty(&g.rc_notes)) view_ensure_visible(g.rc_notes.top - dp(40), g.rc_notes.bottom + dp(12));
+        else if (r.bottom > r.top) view_ensure_visible(r.bottom - dp(200), r.bottom);
+    }
+    ui_redraw();
+}
+
+static void cell_menu(int k, int sx, int sy)
+{
+    static const char *const lab[4] = { "View this day", "Add event or reminder\xE2\x80\xA6",
+                                        "Write a note", "Make it today" };
+    bool ok; int32_t abs = cell_abs(k, &ok); int c;
+    POINT p;
+    if (!ok) return;
+    p.x = sx; p.y = sy;
+    ClientToScreen(g.hwnd, &p);
+    c = ui_popup_choice(g.hwnd, p.x, p.y, dp(180), lab, 4, -1);
+    if (c < 0) return;
+    if (k >= 0 && k < 32) g.grid_k = k;
+    if (c == 3) { do_set_current(abs); return; }
+    ui_notes_flush();
+    ACT(alm_select(&g.a, abs, true));
+    if (c == 1) open_form_shortcut();
+    else if (c == 2) notes_shortcut();
+}
+
+static void dispatch(int id, int arg, const RECT *hr)
+{
+    bool ok;
+    stop_fade();
+    switch (id) {
+    case H_SEED:          ui_open_settings(true); break;
+    case H_UNIT_F:        DURABLE(ACT(alm_set_unit(&g.a, false))); break;
+    case H_UNIT_C:        DURABLE(ACT(alm_set_unit(&g.a, true))); break;
+    case H_SOUND:         ui_sound_toggle(); break;
+    case H_SETTINGS:
+    case H_INTRO_SETTINGS:
+    case H_FOOT_SETTINGS: ui_open_settings(false); break;
+    case H_ADVANCE:       do_advance(); to_weather(); break;
+    case H_PREV_HOUR:     do_step_hour(-1); break;
+    case H_NEXT_HOUR:     if (g.a.current < 0) do_advance(); else do_step_hour(+1); break;
+    case H_CHAIN_X:       ACT(alm_hide_chain_note(&g.a)); break;
+    case H_DAY_PREV:      do_step_day(-1); break;
+    case H_DAY_NEXT:      do_step_day(+1); break;
+    case H_PLAY:          ACT(alm_toggle_play(&g.a)); break;
+    case H_CAL_PREV:      ui_apply(alm_cal_step(&g.a, -1)); break;
+    case H_CAL_NEXT:      ui_apply(alm_cal_step(&g.a, +1)); break;
+    case H_CAL_TODAY:
+    case H_BACK_TODAY:    do_today(); to_weather(); break;
+    case H_HEAD_NOW:      to_weather(); break;
+    case H_KEYS:          g.keys_on = !g.keys_on; ui_redraw(); break;
+    case H_KEYS_CARD:     g.keys_on = false; ui_redraw(); break;
+    case H_SAVE_FAIL: {
+        WCHAR m[600];
+        ui_export_backup(g.hwnd, m, 600);
+        if (m[0]) { char *u = u8_dup(m); if (u) { ui_toast(u); free(u); } }
+        break;
+    }
+    case H_CAL_CELL: {
+        int32_t abs = cell_abs(arg, &ok);
+        if (!ok) break;
+        if (arg >= 0 && arg < 32) g.grid_k = arg;
+        ui_notes_flush();
+        ACT(alm_select(&g.a, abs, true));
+        break;
+    }
+    case H_UPCOMING: {
+        ui_notes_flush();
+        ACT(alm_select(&g.a, (int32_t)arg, false));
+        break;
+    }
+    case H_SET_CURRENT:   do_set_current(g.a.sel_abs); break;
+    case H_EV_EDIT:
+    case H_EV_DEL:        ev_action(id, arg); break;
+    case H_ADD_EVENT:     ui_open_form(NULL); break;
+    case H_FORM_TYPE:
+        if (arg >= 0 && arg < ALM_EV_TYPE_COUNT) { g.form_type = arg; ui_redraw(); }
+        break;
+    case H_FORM_REPEAT:   if (hr) form_repeat_popup(hr); break;
+    case H_FORM_CANCEL:   ui_close_form(); break;
+    case H_FORM_SAVE:     ui_form_submit(); break;
+    case H_NOTES:         ui_notes_begin(); break;
+    case H_TOAST:         toast_hide(); break;
+    default:              break;   /* H_NONE, H_TIP, H_TIMELINE (press), H_SCROLL (press), H_S_* */
+    }
+}
+
+/* ================================================================== tooltips */
+
+static void tip_init(void)
+{
+    TOOLINFOW ti;
+    INITCOMMONCONTROLSEX ic;
+    ic.dwSize = sizeof ic; ic.dwICC = ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&ic);
+    g.tip_hwnd = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                                 CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g.hwnd, NULL, g.inst, NULL);
+    if (!g.tip_hwnd) return;
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize = TTTOOLINFOW_V2_SIZE;
+    ti.uFlags = TTF_SUBCLASS;
+    ti.hwnd = g.hwnd;
+    ti.uId = 1;
+    ti.lpszText = (LPWSTR)L"";
+    SetRectEmpty(&ti.rect);
+    SendMessageW(g.tip_hwnd, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    SendMessageW(g.tip_hwnd, TTM_SETMAXTIPWIDTH, 0, dp(380));
+    /* dark tips: theming off (so the colours apply on every Windows build), page colours */
+    dark_theme(g.tip_hwnd, L"");
+    {
+        static SetWindowThemeFn fn2; static bool tried2;
+        if (!tried2) { tried2 = true; if (s_uxtheme) fn2 = (SetWindowThemeFn)(void (*)(void))GetProcAddress(s_uxtheme, "SetWindowTheme"); }
+        if (fn2) fn2(g.tip_hwnd, L"", L"");
+    }
+    SendMessageW(g.tip_hwnd, TTM_SETTIPBKCOLOR, (WPARAM)RGB_OF(C_PANEL2), 0);
+    SendMessageW(g.tip_hwnd, TTM_SETTIPTEXTCOLOR, (WPARAM)RGB_OF(C_TEXT), 0);
+    {
+        RECT m; SetRect(&m, dp(4), dp(3), dp(4), dp(3));
+        SendMessageW(g.tip_hwnd, TTM_SETMARGIN, 0, (LPARAM)&m);
+    }
+    SendMessageW(g.tip_hwnd, TTM_SETDELAYTIME, TTDT_INITIAL, 450);
+    SendMessageW(g.tip_hwnd, TTM_SETDELAYTIME, TTDT_AUTOPOP, 12000);
+    s_tip_tool_owner = g.hwnd;
+}
+
+static void tip_set(const Hot *h)
+{
+    TOOLINFOW ti;
+    const WCHAR *t = h && h->tip[0] ? h->tip : L"";
+    RECT r;
+    if (!g.tip_hwnd) return;
+    if (h && h->tip[0]) r = h->r; else SetRectEmpty(&r);
+    if (lstrcmpW(t, g.tip) == 0 && EqualRect(&r, &s_tip_rect)) return;
+    lstrcpynW(g.tip, t, TIP_CAP);
+    s_tip_rect = r;
+    SendMessageW(g.tip_hwnd, TTM_POP, 0, 0);
+    memset(&ti, 0, sizeof ti);
+    ti.cbSize = TTTOOLINFOW_V2_SIZE;
+    ti.hwnd = s_tip_tool_owner;
+    ti.uId = 1;
+    ti.rect = r;
+    SendMessageW(g.tip_hwnd, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+    ti.lpszText = g.tip;
+    ti.hinst = NULL;
+    SendMessageW(g.tip_hwnd, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+}
+
+/* ================================================================== hover */
+
+static void hover_at(int x, int y, bool inside)
+{
+    const Hot *h = inside ? hot_find(&g.hl, x, y) : NULL;
+    int id = h ? h->id : H_NONE, arg = h ? h->arg : 0;
+    tip_set(h);
+    if (id != g.hot_id || arg != g.hot_arg) {
+        g.hot_id = id; g.hot_arg = arg;
+        ui_redraw();
+    }
+}
+
+static void hover_refresh(void)
+{
+    POINT p; RECT cr;
+    if (!g.hwnd || !GetCursorPos(&p)) return;
+    ScreenToClient(g.hwnd, &p);
+    GetClientRect(g.hwnd, &cr);
+    hover_at(p.x, p.y, PtInRect(&cr, p) && GetForegroundWindow() == g.hwnd);
+}
+
+static bool clickable(const Hot *h)
+{
+    return h && h->enabled && h->id != H_NONE && h->id != H_TIP;
+}
+
+/* ================================================================== calendar grid keys */
+
+static void grid_enter(void)
+{
+    int k = cell_of_sel();
+    g.grid_focus = true;
+    g.grid_k = k >= 0 ? k : 0;
+    s_grid_scroll = true;
+    ui_redraw();
+}
+
+static void grid_leave(void)
+{
+    if (!g.grid_focus) return;
+    g.grid_focus = false;
+    ui_redraw();
+}
+
+static bool grid_key(WPARAM vk, bool shift)
+{
+    AlmCell c[32]; int n = view_cells(c), k = clampi(g.grid_k, 0, n > 0 ? n - 1 : 0), nk = -1;
+    switch (vk) {
+    case VK_RIGHT: nk = k + 1; break;
+    case VK_LEFT:  nk = k - 1; break;
+    case VK_DOWN:  nk = k < 30 ? (k + 10 < n - 1 ? k + 10 : n - 1) : k; break;
+    case VK_UP:    nk = k >= 30 ? 29 : k - 10; break;
+    case VK_HOME:  nk = 0; break;
+    case VK_END:   nk = n - 1; break;
+    case VK_RETURN:
+        if (n > 0) {
+            ui_notes_flush();
+            if (shift) do_set_current(c[k].abs);
+            else ACT(alm_select(&g.a, c[k].abs, true));
+        }
+        return true;
+    case VK_SPACE:
+        if (n > 0) { ui_notes_flush(); ACT(alm_select(&g.a, c[k].abs, true)); }
+        return true;
+    case VK_ESCAPE: case VK_TAB:
+        grid_leave();
+        return true;
+    default:
+        return false;
+    }
+    if (nk >= 0 && nk < n && nk != g.grid_k) { g.grid_k = nk; s_grid_scroll = true; ui_redraw(); }
+    return true;
+}
+
+/* ================================================================== keyboard */
+
+static int line_px(void) { return dp(48); }
+
+static void on_key(WPARAM vk, LPARAM lp)
+{
+    bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    bool repeat = (lp & 0x40000000) != 0;
+    stop_fade();
+    if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) return;
+    if (vk == VK_F1) { if (!repeat) { g.keys_on = !g.keys_on; ui_redraw(); } return; }
+    if (g.keys_on && vk != VK_OEM_2) {                  /* the keys card: any key closes it */
+        g.keys_on = false;
+        ui_redraw();
+        if (vk == VK_ESCAPE) return;
+    }
+    if (vk == VK_F2 || (ctrl && vk == VK_OEM_COMMA)) { ui_open_settings(false); return; }
+    if (ctrl && vk == 'C') { copy_seed(); return; }
+    if ((ctrl && vk == 'Z') || (!ctrl && vk == VK_BACK)) { if (!repeat) do_undo(); return; }
+    if (ctrl && vk == VK_HOME) { view_scroll_to(0); return; }
+    if (ctrl && vk == VK_END) { view_scroll_to(g.content_h); return; }
+    if (g.grid_focus && grid_key(vk, shift)) return;
+    if (ctrl) return;
+    /* one press = one day: auto-repeat only steps hours and scrolls */
+    if (repeat && (vk == 'N' || vk == VK_PRIOR || vk == VK_NEXT || vk == 'T' || vk == 'E' ||
+                   vk == 'O' || vk == 'P' || vk == 'U' || vk == 'M' || vk == VK_TAB || vk == VK_RETURN)) return;
+    switch (vk) {
+    case VK_RIGHT: case VK_SPACE:
+        if (g.a.current < 0) do_advance();              /* intro: the session's keys begin it */
+        else do_step_hour(+1);
+        to_weather();
+        break;
+    case VK_LEFT:  do_step_hour(-1); to_weather(); break;
+    case VK_HOME:  do_set_hour(0); to_weather(); break;
+    case VK_END:   do_set_hour(23); to_weather(); break;
+    case 'N':      do_advance(); to_weather(); break;
+    case VK_PRIOR: do_step_day(-1); to_weather(); break;
+    case VK_NEXT:  do_step_day(+1); to_weather(); break;
+    case VK_UP:    view_scroll_to(g.scroll - line_px()); break;
+    case VK_DOWN:  view_scroll_to(g.scroll + line_px()); break;
+    case 'T':      do_today(); to_weather(); break;
+    case 'P':      ACT(alm_toggle_play(&g.a)); break;
+    case 'U':      DURABLE(ACT(alm_set_unit(&g.a, !g.a.celsius))); break;
+    case 'M':      ui_sound_toggle(); break;
+    case 'E':      if (g.a.sel_abs != INT32_MIN) open_form_shortcut(); break;
+    case 'O':      notes_shortcut(); break;
+    case VK_TAB:   grid_enter(); break;
+    case VK_ESCAPE:
+        if (g.form_open) ui_close_form();
+        else if (g.toast_on) toast_hide();
+        else if (g.a.current >= 0 && g.a.view != g.a.current) { do_today(); to_weather(); }
+        break;
+    default: break;
+    }
+}
+
+/* ================================================================== window helpers */
 
 static UINT query_dpi(HWND hwnd)
 {
@@ -1043,39 +1483,103 @@ static void dark_titlebar(HWND hwnd)
 static void set_client_size(HWND hwnd, int cw, int ch)
 {
     RECT wr, cr, wa;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi; mi.cbSize = sizeof mi;
     GetWindowRect(hwnd, &wr); GetClientRect(hwnd, &cr);
     cw += (wr.right - wr.left) - cr.right; ch += (wr.bottom - wr.top) - cr.bottom;
-    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
-        if (cw > wa.right - wa.left) cw = wa.right - wa.left;
-        if (ch > wa.bottom - wa.top) ch = wa.bottom - wa.top;
-        if (wr.left + cw > wa.right) wr.left = wa.right - cw;
-        if (wr.top + ch > wa.bottom) wr.top = wa.bottom - ch;
-        if (wr.left < wa.left) wr.left = wa.left;
-        if (wr.top < wa.top) wr.top = wa.top;
-    }
+    if (GetMonitorInfoW(mon, &mi)) wa = mi.rcWork;
+    else if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) SetRect(&wa, 0, 0, 1 << 15, 1 << 15);
+    if (cw > wa.right - wa.left) cw = wa.right - wa.left;
+    if (ch > wa.bottom - wa.top) ch = wa.bottom - wa.top;
+    wr.left = wa.left + ((wa.right - wa.left) - cw) / 2;
+    wr.top = wa.top + ((wa.bottom - wa.top) - ch) / 2;
     SetWindowPos(hwnd, NULL, wr.left, wr.top, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-static void on_size(int w, int h)
+/* exact client size, no clamping (test hook --size) */
+static void force_client_size(HWND hwnd, int cw, int ch)
 {
-    backbuffer_resize(w, h);
-    layout();
-    text_layout();
-    g_scroll = clampi(g_scroll, 0, text_max_scroll());
-    g_dirty = D_ALL;
-    InvalidateRect(g_hwnd, NULL, FALSE);
+    RECT wr, cr;
+    GetWindowRect(hwnd, &wr); GetClientRect(hwnd, &cr);
+    cw += (wr.right - wr.left) - cr.right; ch += (wr.bottom - wr.top) - cr.bottom;
+    SetWindowPos(hwnd, NULL, 0, 0, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
 }
+
+static void store_placement(void)
+{
+    WINDOWPLACEMENT wp;
+    wp.length = sizeof wp;
+    if (!g.hwnd || !GetWindowPlacement(g.hwnd, &wp)) return;
+    g.a.native.has_rect = true;
+    g.a.native.win_x = wp.rcNormalPosition.left;
+    g.a.native.win_y = wp.rcNormalPosition.top;
+    g.a.native.win_w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+    g.a.native.win_h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    g.a.native.maximized = wp.showCmd == SW_SHOWMAXIMIZED || IsZoomed(g.hwnd);
+}
+
+static bool restore_placement(int show)
+{
+    WINDOWPLACEMENT wp; RECT r;
+    const AlmNative *n = &g.a.native;
+    if (!n->has_rect || n->win_w < 200 || n->win_h < 150) return false;
+    SetRect(&r, n->win_x, n->win_y, n->win_x + n->win_w, n->win_y + n->win_h);
+    if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL)) return false;
+    memset(&wp, 0, sizeof wp);
+    wp.length = sizeof wp;
+    wp.rcNormalPosition = r;
+    wp.showCmd = n->maximized ? SW_SHOWMAXIMIZED : (show == SW_SHOWMINIMIZED || show == SW_MINIMIZE ? SW_SHOWNORMAL : show);
+    if (wp.showCmd == SW_HIDE || wp.showCmd == 0) wp.showCmd = SW_SHOWNORMAL;
+    return SetWindowPlacement(g.hwnd, &wp) != 0;
+}
+
+static void on_resize(int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    surf_resize(&g.back, w, h);
+    ui_relayout();
+}
+
+static void restyle_all(void)
+{
+    if (g.ed_title) ui_style_edit(g.ed_title, F_BODY);
+    if (g.ed_details) ui_style_edit(g.ed_details, F_BODY);
+    if (g.ed_notes) ui_style_edit(g.ed_notes, F_BODY);
+    if (g.tip_hwnd) SendMessageW(g.tip_hwnd, TTM_SETMAXTIPWIDTH, 0, dp(380));
+}
+
+static void close_and_save(void)
+{
+    ui_notes_flush();
+    if (g.a.playing) { AlmResult r = alm_toggle_play(&g.a); (void)r; play_sync(); }
+    store_placement();
+    ui_save_now();
+}
+
+/* ================================================================== test hooks */
+
+static void run_open_hook(void)
+{
+    SetForegroundWindow(g.hwnd);
+    SetFocus(g.hwnd);
+    if (s_opt_open == 1) ui_open_settings(false);
+    else if (s_opt_open == 2) ui_open_form(NULL);
+    s_opt_open = 0;
+}
+
+/* ================================================================== window proc */
 
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE:
-        g_hwnd = hwnd;
-        g_dpi = (int)query_dpi(hwnd);
-        g_dc = CreateCompatibleDC(NULL);
+        g.hwnd = hwnd;
+        g.dpi = (int)query_dpi(hwnd);
         fonts_make();
-        text_build();
+        if (!g.br_field) g.br_field = CreateSolidBrush(RGB_OF(C_FIELD));
+        if (!g.br_field_dis) g.br_field_dis = CreateSolidBrush(RGB_OF(C_PANEL));
         dark_titlebar(hwnd);
+        tip_init();
         return 0;
 
     case WM_ERASEBKGND:
@@ -1083,22 +1587,49 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(hwnd, &ps);
-        if (g_px) {
-            if (g_dirty) render();
-            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
-                   ps.rcPaint.bottom - ps.rcPaint.top, g_dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        RECT cr; GetClientRect(hwnd, &cr);
+        if (cr.right > 0 && cr.bottom > 0 && (g.back.w != cr.right || g.back.h != cr.bottom)) {
+            surf_resize(&g.back, cr.right, cr.bottom);
+            s_dirty = true;
         }
+        if (g.back.px && s_dirty) { s_dirty = false; view_paint(); }
+        if (g.back.dc)
+            BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
+                   ps.rcPaint.bottom - ps.rcPaint.top, g.back.dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
         EndPaint(hwnd, &ps);
+        edits_sync();
+        if (s_form_scroll && !IsRectEmpty(&g.rc_title)) {
+            s_form_scroll = false;
+            view_ensure_visible(g.rc_title.top - dp(60), IsRectEmpty(&g.rc_details) ? g.rc_title.bottom : g.rc_details.bottom + dp(60));
+        }
+        if (s_grid_scroll) {
+            int i;
+            s_grid_scroll = false;
+            for (i = 0; i < g.hl.n; i++) {
+                const Hot *h = &g.hl.items[i];
+                if (h->id == H_CAL_CELL && h->arg == g.grid_k) {
+                    view_ensure_visible(view_content_y(h->r.top), view_content_y(h->r.bottom));
+                    break;
+                }
+            }
+        }
+        if (!g.press_id && !g.scrubbing && !g.sb_drag) hover_refresh();
+        if (s_opt_shot_ready) {
+            s_opt_shot_ready = false;
+            s_title_ready = true;
+            title_sync();
+        }
         return 0;
     }
 
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) on_size(LOWORD(lp), HIWORD(lp));
+        if (wp != SIZE_MINIMIZED) on_resize(LOWORD(lp), HIWORD(lp));
         return 0;
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mm = (MINMAXINFO *)lp; RECT r;
-        SetRect(&r, 0, 0, dp(640), dp(480));
+        int d = g.dpi ? g.dpi : 96;
+        SetRect(&r, 0, 0, MulDiv(640, d, 96), MulDiv(560, d, 96));   /* half of a 1366 px laptop screen */
         AdjustWindowRectEx(&r, (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
         mm->ptMinTrackSize.x = r.right - r.left; mm->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
@@ -1106,160 +1637,434 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case 0x02E0: {  /* WM_DPICHANGED */
         const RECT *r = (const RECT *)lp;
-        g_dpi = HIWORD(wp);
+        g.dpi = HIWORD(wp) ? HIWORD(wp) : 96;
         fonts_make();
+        view_free();
+        scene_free();
+        thumb_free();
+        restyle_all();
+        settings_fonts_changed();
         SetWindowPos(hwnd, NULL, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        on_size(g_w, g_h);
+        ui_relayout();
         return 0;
     }
 
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-        if (!g_tracking) {
+        if (!g.tracking) {
             TRACKMOUSEEVENT t; t.cbSize = sizeof(t); t.dwFlags = TME_LEAVE; t.hwndTrack = hwnd; t.dwHoverTime = 0;
-            g_tracking = TrackMouseEvent(&t);
+            g.tracking = TrackMouseEvent(&t) != 0;
         }
-        if (g_scrub) {
-            int w = g_rcBar.right - g_rcBar.left, c = w > 0 ? clampi((x - g_rcBar.left) * 24 / w, 0, 23) : 0;
-            if (x < g_rcBar.left) c = 0;
-            set_hover(c, -1);
-            set_hour(c);
-        } else {
-            set_hover(g_pressBtn >= 0 ? -1 : hit_cell(x, y), hit_btn(x, y));
+        if (g.sb_drag) { view_scroll_to(view_scroll_for_thumb(y)); return 0; }
+        if (g.scrubbing) {
+            double t = view_timeline_time(x);
+            if (fabs(t - g.a.time) > 1e-9) ui_apply(alm_set_time(&g.a, t, true));
+            return 0;
         }
+        hover_at(x, y, true);
         return 0;
     }
 
     case WM_MOUSELEAVE:
-        g_tracking = FALSE;
-        if (!g_scrub && g_pressBtn < 0) set_hover(-1, -1);
+        g.tracking = false;
+        if (!g.scrubbing && !g.press_id && !g.sb_drag) hover_at(0, 0, false);
         return 0;
 
     case WM_LBUTTONDOWN:
     case WM_LBUTTONDBLCLK: {
-        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), c = hit_cell(x, y), b = hit_btn(x, y);
-        if (g_focusBtn >= 0) { g_focusBtn = -1; mark(D_BTN); }   /* the mouse takes over */
-        if (b >= 0 && btn_enabled(b)) {
-            g_pressBtn = b; g_hoverBtn = b; SetCapture(hwnd); mark(D_BTN);
-        } else if (c >= 0) {
-            g_scrub = TRUE; SetCapture(hwnd); set_hover(c, -1); set_hour(c);
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        const Hot *h = hot_find(&g.hl, x, y);
+        Hot hc;
+        if (!h) { if (GetFocus() != hwnd) SetFocus(hwnd); grid_leave(); return 0; }
+        hc = *h;
+        if (hc.id != H_NOTES && GetFocus() != hwnd && hc.id != H_FORM_TYPE && hc.id != H_FORM_REPEAT) SetFocus(hwnd);
+        if (!hc.enabled) return 0;
+        if (hc.id != H_CAL_CELL && hc.id != H_SCROLL && hc.id != H_TOAST && g.grid_focus) grid_leave();
+        if (msg == WM_LBUTTONDBLCLK && hc.id == H_CAL_CELL) {
+            bool ok; int32_t abs = cell_abs(hc.arg, &ok);
+            if (ok) do_set_current(abs);
+            return 0;
         }
+        if (hc.id == H_SCROLL) {
+            if (hc.arg == 0) {
+                g.sb_drag = true; g.sb_grab = y - hc.r.top;
+                SetCapture(hwnd);
+                ui_redraw();
+            } else {
+                int vh = g.back.h - view_header_h();
+                view_scroll_to(g.scroll + hc.arg * (vh - dp(40)));
+            }
+            return 0;
+        }
+        if (hc.id == H_TIMELINE) {
+            if (!alm_has_view(&g.a) || g.a.busy) return 0;
+            g.scrubbing = true;
+            SetCapture(hwnd);
+            ui_apply(alm_set_time(&g.a, view_timeline_time(x), true));
+            ui_redraw();
+            return 0;
+        }
+        if (hc.id == H_NONE || hc.id == H_TIP) return 0;
+        g.press_id = hc.id; g.press_arg = hc.arg;
+        g.hot_id = hc.id; g.hot_arg = hc.arg;
+        SetCapture(hwnd);
+        ui_redraw();
         return 0;
     }
 
     case WM_LBUTTONUP: {
-        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp), b = g_pressBtn;
-        BOOL fire = b >= 0 && hit_btn(x, y) == b;
-        g_pressBtn = -1; g_scrub = FALSE;
-        if (GetCapture() == hwnd) ReleaseCapture();
-        if (b >= 0) mark(D_BTN);
-        if (fire) press_button(b);
-        set_hover(hit_cell(x, y), hit_btn(x, y));
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        if (g.scrubbing) {
+            g.scrubbing = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            ui_redraw();
+            return 0;
+        }
+        if (g.sb_drag) {
+            g.sb_drag = false;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            ui_redraw();
+            return 0;
+        }
+        if (g.press_id) {
+            int id = g.press_id, arg = g.press_arg;
+            const Hot *h = hot_find(&g.hl, x, y);
+            Hot hc; bool fire = h && h->id == id && h->arg == arg && h->enabled;
+            if (fire) hc = *h;
+            g.press_id = 0; g.press_arg = 0;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            ui_redraw();
+            if (fire) dispatch(id, arg, &hc.r);
+            hover_refresh();
+        }
         return 0;
     }
 
     case WM_CAPTURECHANGED:
-        if (g_pressBtn >= 0) { g_pressBtn = -1; mark(D_BTN); }
-        g_scrub = FALSE;
+        if ((HWND)lp != hwnd) {
+            if (g.press_id || g.scrubbing || g.sb_drag) ui_redraw();
+            g.press_id = 0; g.scrubbing = false; g.sb_drag = false;
+        }
         return 0;
 
     case WM_MOUSEWHEEL:
-        scroll_to(g_scroll - GET_WHEEL_DELTA_WPARAM(wp) * g_lineH * 3 / WHEEL_DELTA);
+        view_scroll_to(g.scroll - GET_WHEEL_DELTA_WPARAM(wp) * dp(60) / WHEEL_DELTA);
         return 0;
 
     case WM_SETCURSOR:
-        if (LOWORD(lp) == HTCLIENT) {
-            POINT p; int b;
+        if (LOWORD(lp) == HTCLIENT && (HWND)wp == hwnd) {
+            POINT p; const Hot *h;
             GetCursorPos(&p); ScreenToClient(hwnd, &p);
-            b = hit_btn(p.x, p.y);
-            SetCursor(LoadCursorW(NULL, (b >= 0 && btn_enabled(b)) || hit_cell(p.x, p.y) >= 0 ? (LPCWSTR)IDC_HAND : (LPCWSTR)IDC_ARROW));
+            h = hot_find(&g.hl, p.x, p.y);
+            SetCursor(LoadCursorW(NULL, clickable(h) || g.scrubbing ? (LPCWSTR)IDC_HAND : (LPCWSTR)IDC_ARROW));
             return TRUE;
         }
         break;
 
     case WM_KEYDOWN:
+        if (!any_edit_focused() && IsWindowEnabled(hwnd)) on_key(wp, lp);
+        return 0;
+
+    case WM_SYSKEYDOWN:
+        if (wp == VK_F10) return 0;
+        break;
+
+    case WM_CHAR:                                          /* '?' on any keyboard layout */
+        if (wp == L'?' && !any_edit_focused()) { g.keys_on = !g.keys_on; ui_redraw(); }
+        return 0;
+
+    case WM_RBUTTONUP: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        const Hot *h = hot_find(&g.hl, x, y);
+        if (h && h->enabled && h->id == H_CAL_CELL) {
+            int k = h->arg;
+            if (GetFocus() != hwnd) SetFocus(hwnd);
+            cell_menu(k, x, y);
+        }
+        return 0;
+    }
+
+    case WM_TIMER:
         switch (wp) {
-        case VK_LEFT:  if (g_has) set_hour((g_cur + 23) % 24); break;
-        case VK_RIGHT: if (g_has) set_hour((g_cur + 1) % 24); break;
-        case VK_HOME:  set_hour(0); break;
-        case VK_END:   set_hour(23); break;
-        case VK_UP:    scroll_to(g_scroll - g_lineH); break;
-        case VK_DOWN:  scroll_to(g_scroll + g_lineH); break;
-        case VK_PRIOR: scroll_to(g_scroll - text_view_h()); break;
-        case VK_NEXT:  scroll_to(g_scroll + text_view_h()); break;
-        case 'N': case VK_F5: do_new_day(); break;
-        case VK_TAB:   focus_step(GetKeyState(VK_SHIFT) < 0 ? -1 : 1); break;
-        case VK_SPACE: case VK_RETURN:
-            if (g_focusBtn >= 0 && btn_enabled(g_focusBtn)) press_button(g_focusBtn);
+        case T_PLAY: {
+            ULONGLONG now = GetTickCount64();
+            double dt = (double)(now - g.play_last) / 1000.0 / IWD_SECONDS_PER_HOUR;
+            g.play_last = now;
+            if (!g.a.playing) { play_sync(); break; }
+            if (dt > 2.0) dt = 2.0;
+            {
+                AlmResult r = alm_play_tick(&g.a, dt);
+                if (g.a.playing) r.fx &= ~(unsigned)ALM_FX_SAVE;
+                ui_apply(r);
+            }
             break;
-        case 'C': case VK_INSERT: if (GetKeyState(VK_CONTROL) < 0) copy_text(hwnd); break;
-        default: break;                                       /* Esc and everything else: nothing */
+        }
+        case T_TOAST: KillTimer(hwnd, T_TOAST); if (!g.toast_sticky) toast_hide(); break;
+        case T_NOTE:  KillTimer(hwnd, T_NOTE); ui_notes_flush(); break;
+        case T_ARM:   KillTimer(hwnd, T_ARM); g.armed_id[0] = 0; ui_redraw(); break;
+        case T_SAVE:  KillTimer(hwnd, T_SAVE); if (s_save_pending) save_write(false); break;
+        case T_FADE:
+            if (g.fade_k > 0) g.fade_k--;
+            if (g.fade_k <= 0) { g.fade_k = 0; KillTimer(hwnd, T_FADE); }
+            ui_redraw();
+            break;
+        case T_THUNDER:
+            KillTimer(hwnd, T_THUNDER);
+            s_thunder_timer = false;
+            if (audio_is_enabled() && viewed_event() == 10) audio_thunder(0.5 + (rnd32() % 1000) / 2000.0);
+            thunder_sync();
+            break;
+        default: KillTimer(hwnd, wp); break;
         }
         return 0;
 
+    case WM_COMMAND: {
+        HWND c = (HWND)lp; int code = HIWORD(wp);
+        if (c && c == g.ed_notes) {
+            if (code == EN_CHANGE) {
+                g.note_pending = true;
+                if (g.note_state != 1) { g.note_state = 1; ui_redraw(); }
+                SetTimer(hwnd, T_NOTE, ALM_NOTE_DEBOUNCE_MS, NULL);
+            } else if (code == EN_KILLFOCUS) {
+                ui_notes_flush();
+                PostMessageW(hwnd, WM_APP_DROP_NOTES, 0, 0);
+            } else if (code == EN_SETFOCUS) {
+                ui_redraw();
+            }
+        } else if (c && c == g.ed_title) {
+            if (code == EN_CHANGE && g.form_invalid) { g.form_invalid = false; ui_redraw(); }
+            else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) ui_redraw();
+        } else if (c && c == g.ed_details) {
+            if (code == EN_SETFOCUS || code == EN_KILLFOCUS) ui_redraw();
+            else if (code == EN_CHANGE) edit_vsb(c);
+        }
+        if (c && c == g.ed_notes && code == EN_CHANGE) edit_vsb(c);
+        return 0;
+    }
+
+    case WM_APP_DROP_NOTES:
+        if (g.ed_notes && GetFocus() != g.ed_notes) notes_drop();
+        return 0;
+
+    case WM_APP_HOOKS:
+        run_open_hook();
+        return 0;
+
+    case WM_CTLCOLOREDIT:
+        SetTextColor((HDC)wp, RGB_OF(C_TEXT));
+        SetBkColor((HDC)wp, RGB_OF(C_FIELD));
+        return (LRESULT)g.br_field;
+
+    case WM_CTLCOLORSTATIC:
+        SetTextColor((HDC)wp, RGB_OF(C_MUTED));
+        SetBkColor((HDC)wp, RGB_OF(C_PANEL));
+        return (LRESULT)g.br_field_dis;
+
+    case WM_MEASUREITEM:
+        if (ui_menu_measure((MEASUREITEMSTRUCT *)lp)) return TRUE;
+        break;
+
+    case WM_DRAWITEM:
+        if (ui_menu_draw((DRAWITEMSTRUCT *)lp)) return TRUE;
+        break;
+
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) hover_at(0, 0, false);
+        break;
+
+    case WM_CLOSE:
+        close_and_save();
+        if (s_save_failed && s_persist) {
+            WCHAR p[MAX_PATH * 2], m[MAX_PATH * 2 + 400];
+            int k;
+            path_w(g.state_path, p, MAX_PATH * 2);
+            wsprintfW(m, L"Could not save the almanac to\n%s\n\nYes: save a backup somewhere else first\nNo: close anyway (recent changes are lost)\nCancel: keep the window open", p);
+            k = MessageBoxW(hwnd, m, L"Icewind Dale Almanac", MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1);
+            if (k == IDCANCEL) return 0;
+            if (k == IDYES) {
+                WCHAR msg[600];
+                ui_export_backup(hwnd, msg, 600);
+                if (!msg[0] || wcsncmp(msg, L"Backup saved", 12) != 0) {   /* cancelled / failed: stay */
+                    if (msg[0]) { char *u = u8_dup(msg); if (u) { ui_toast(u); free(u); } }
+                    return 0;
+                }
+            }
+        }
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        close_and_save();
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wp) close_and_save();
+        return 0;
+
     case WM_DESTROY:
+        KillTimer(hwnd, T_PLAY); KillTimer(hwnd, T_TOAST); KillTimer(hwnd, T_NOTE);
+        KillTimer(hwnd, T_ARM); KillTimer(hwnd, T_SAVE); KillTimer(hwnd, T_THUNDER);
+        KillTimer(hwnd, T_FADE);
+        s_play_timer = s_thunder_timer = false;
+        audio_shutdown();
+        if (g.tip_hwnd) { DestroyWindow(g.tip_hwnd); g.tip_hwnd = NULL; }
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void cleanup(void)
+/* ================================================================== startup */
+
+static bool parse_int(const WCHAR *s, long long *out, const WCHAR **end)
 {
-    int i;
-    fonts_free();
-    if (g_bmp) { SelectObject(g_dc, g_bmpOld); DeleteObject(g_bmp); g_bmp = NULL; g_px = NULL; }
-    if (g_dc) { DeleteDC(g_dc); g_dc = NULL; }
-    for (i = 1; i <= 12; i++) { xfree(g_img[i].px); g_img[i].px = NULL; }
-    xfree(g_scenePx); g_scenePx = NULL;
-    xfree(g_barPx); g_barPx = NULL;
-    if (g_gdipToken) { GdiplusShutdown(g_gdipToken); g_gdipToken = 0; }
+    long long v = 0; int n = 0; bool neg = false;
+    if (!s) return false;
+    if (*s == L'-' || *s == L'+') { neg = *s == L'-'; s++; }
+    while (*s >= L'0' && *s <= L'9') {
+        v = v * 10 + (*s - L'0');
+        if (v > 2000000000LL) return false;
+        s++; n++;
+    }
+    if (!n) return false;
+    *out = neg ? -v : v;
+    if (end) *end = s;
+    else if (*s) return false;
+    return true;
 }
 
-/* ------------------------------------------------------------- startup */
-
-static BOOL parse_u32(const WCHAR *s, unsigned *out, const WCHAR **end)
+static void parse_args(void)
 {
-    unsigned long long v = 0; int n = 0;
-    while (*s >= L'0' && *s <= L'9') { v = v * 10 + (unsigned)(*s - L'0'); if (v > 0xFFFFFFFFull) return FALSE; s++; n++; }
-    if (!n) return FALSE;
-    *out = (unsigned)v;
-    if (end) *end = s;
-    return TRUE;
+    int argc = 0, i;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (i = 1; argv && i < argc; i++) {
+        const WCHAR *a = argv[i], *n = i + 1 < argc ? argv[i + 1] : NULL, *end;
+        long long v, v2;
+        if (!lstrcmpW(a, L"--shot-ready")) { s_opt_shot_ready = true; continue; }
+        if (!n) break;
+        if (!lstrcmpW(a, L"--state")) { s_opt_state = _wcsdup(n); i++; }
+        else if (!lstrcmpW(a, L"--seed")) {
+            int k = WideCharToMultiByte(CP_UTF8, 0, n, -1, NULL, 0, NULL, NULL);
+            if (k > 0 && (s_opt_seed = (char *)malloc((size_t)k)) != NULL)
+                WideCharToMultiByte(CP_UTF8, 0, n, -1, s_opt_seed, k, NULL, NULL);
+            i++;
+        }
+        else if (!lstrcmpW(a, L"--days") && parse_int(n, &v, NULL)) { s_opt_days = (int)(v < 0 ? 0 : v > IWD_MAX_DAYS ? IWD_MAX_DAYS : v); i++; }
+        else if (!lstrcmpW(a, L"--select") && parse_int(n, &v, NULL)) { s_opt_select = (int)v; i++; }
+        else if (!lstrcmpW(a, L"--hour") && parse_int(n, &v, NULL)) { s_opt_hour = (int)(v < 0 ? 0 : v > 23 ? 23 : v); i++; }
+        else if (!lstrcmpW(a, L"--scroll") && parse_int(n, &v, NULL)) { s_opt_scroll = (int)(v < 0 ? 0 : v); i++; }
+        else if (!lstrcmpW(a, L"--size") && parse_int(n, &v, &end) && (*end == L'x' || *end == L'X') &&
+                 parse_int(end + 1, &v2, NULL)) {
+            s_opt_w = (int)clampi((int)v, 200, 16000); s_opt_h = (int)clampi((int)v2, 150, 16000); i++;
+        }
+        else if (!lstrcmpW(a, L"--open")) {
+            if (!lstrcmpiW(n, L"settings")) s_opt_open = 1;
+            else if (!lstrcmpiW(n, L"eventform")) s_opt_open = 2;
+            i++;
+        }
+    }
+    if (argv) LocalFree(argv);
+}
+
+static void load_state(void)
+{
+    AlmLoadStatus st;
+    if (!alm_init(&g.a, entropy())) {
+        MessageBoxW(NULL, L"Out of memory.", L"Icewind Dale Almanac", MB_ICONERROR);
+        ExitProcess(1);
+    }
+    s_rng ^= entropy();
+    if (s_opt_seed) {
+        s_persist = s_opt_state != NULL;            /* never overwrite the real save from a test run */
+        load_seeded(s_opt_seed);
+    } else {
+        WCHAR p[MAX_PATH * 2];
+        int tries;
+        DWORD err = 0;
+        path_w(g.state_path, p, MAX_PATH * 2);
+        /* an existing file that cannot be opened (held by a sync or antivirus tool) is not
+           corrupt: wait a little, then run without touching it */
+        for (tries = 0; tries < 6; tries++) {
+            HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); err = 0; break; }
+            err = GetLastError();
+            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) break;
+            Sleep(250);
+        }
+        if (err && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+            s_persist = false;
+            s_boot_notice = 2;
+        } else {
+            st = alm_load_file(&g.a, g.state_path);
+            if (st == ALM_LOAD_NO_MEMORY) {
+                MessageBoxW(NULL, L"Out of memory while loading the almanac.", L"Icewind Dale Almanac", MB_ICONERROR);
+                ExitProcess(1);
+            }
+            if (st == ALM_LOAD_CORRUPT) {
+                /* keep the unreadable save under a unique name; never overwrite it */
+                SYSTEMTIME t; WCHAR b[MAX_PATH * 2 + 40]; const WCHAR *base;
+                GetLocalTime(&t);
+                wsprintfW(b, L"%s.bad-%04d%02d%02d-%02d%02d%02d", p, t.wYear, t.wMonth, t.wDay,
+                          t.wHour, t.wMinute, t.wSecond);
+                base = b + lstrlenW(b);
+                while (base > b && base[-1] != L'\\' && base[-1] != L'/') base--;
+                lstrcpynW(s_bad_name, base, MAX_PATH);
+                if (MoveFileExW(p, b, MOVEFILE_WRITE_THROUGH)) s_boot_notice = 1;
+                else { s_persist = false; s_boot_notice = 3; }
+            }
+        }
+    }
+    if (s_opt_days > 0) {
+        int i;
+        for (i = 0; i < s_opt_days; i++) {
+            AlmResult r = alm_advance(&g.a, IWD_SETTLE_HOUR);
+            if (r.fx & ALM_FX_REJECTED) break;
+        }
+    }
+    if (s_opt_select != INT32_MIN) (void)alm_select(&g.a, g.a.start_abs + s_opt_select, false);
+    if (s_opt_hour >= 0 && alm_has_view(&g.a)) (void)alm_set_time(&g.a, (double)s_opt_hour, true);
+    g.a.playing = false;
+    g.party_time = -1;
+    g.saved_scroll = -1;
+    s_last_sel = g.a.sel_abs;
+    g.notes_abs = INT32_MIN;
+    g.last_wind_event = -1;
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
 {
-    WNDCLASSEXW wc; MSG msg; HWND hwnd; LPWSTR *argv; int argc = 0, i;
-    BOOL optNewDay = FALSE, haveSeed = FALSE; unsigned seed = 0, v;
-    int optHour = -1, optW = 0, optH = 0; const WCHAR *optDump = NULL, *end;
+    WNDCLASSEXW wc; MSG msg; HWND hwnd;
     (void)prev; (void)cmdline;
 
-    g_inst = inst;
-    g_heap = GetProcessHeap();
-
-    argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    for (i = 1; argv && i < argc; i++) {
-        const WCHAR *a = argv[i], *n = i + 1 < argc ? argv[i + 1] : NULL;
-        if (!lstrcmpW(a, L"--newday")) optNewDay = TRUE;
-        else if (!lstrcmpW(a, L"--seed") && n && parse_u32(n, &v, NULL)) { seed = v; haveSeed = TRUE; i++; }
-        else if (!lstrcmpW(a, L"--hour") && n && parse_u32(n, &v, NULL)) { optHour = v > 23 ? 23 : (int)v; i++; }
-        else if (!lstrcmpW(a, L"--dump") && n) { optDump = n; i++; }
-        else if (!lstrcmpW(a, L"--size") && n && parse_u32(n, &v, &end) && (*end == L'x' || *end == L'X')) {
-            unsigned h2;
-            if (parse_u32(end + 1, &h2, NULL)) { optW = (int)(v > 16000 ? 16000 : v); optH = (int)(h2 > 16000 ? 16000 : h2); }
-            i++;
+    g.inst = inst;
+    parse_args();
+    resolve_state_path();
+    if (!s_opt_seed || s_opt_state) {
+        /* one window per save file: a second launch brings the first forward */
+        WCHAR name[80]; uint32_t hsh = 2166136261u; const char *c;
+        for (c = g.state_path; *c; c++) {
+            unsigned char ch = (unsigned char)*c;
+            if (ch >= 'A' && ch <= 'Z') ch = (unsigned char)(ch + 32);
+            hsh = (hsh ^ ch) * 16777619u;
+        }
+        wsprintfW(name, L"Local\\IcewindDaleAlmanac-%08x", hsh);
+        s_mutex = CreateMutexW(NULL, FALSE, name);
+        if (s_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            HWND w = FindWindowW(L"IcewindDaleAlmanac", NULL);
+            if (w) {
+                if (IsIconic(w)) ShowWindow(w, SW_RESTORE);
+                SetForegroundWindow(w);
+            }
+            CloseHandle(s_mutex);
+            return 0;
         }
     }
-    if (haveSeed) rng_seed(seed); else rng_seed_os();
-
-    if (optDump) {                                             /* headless test hook */
-        BOOL ok;
-        new_day();
-        ok = dump_schedule(optDump);
-        LocalFree(argv);
-        return ok ? 0 : 1;
-    }
+    load_state();
+    gdip_up();
+    audio_init();
+    if (!audio_device_present()) g.sound_missing = true;   /* "No audio" from the first paint */
+    settings_register(inst);
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1271,32 +2076,70 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
                                    GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR | LR_SHARED);
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     wc.hbrBackground = NULL;
-    wc.lpszClassName = L"IcewindDaleWeatherHelper";
+    wc.lpszClassName = L"IcewindDaleAlmanac";
     if (!RegisterClassExW(&wc)) return 1;
 
-    hwnd = CreateWindowExW(0, wc.lpszClassName, L"Icewind Dale Weather Helper", WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 800, 640, NULL, NULL, inst, NULL);
+    hwnd = CreateWindowExW(0, wc.lpszClassName, L"Icewind Dale Almanac", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1280, 860, NULL, NULL, inst, NULL);
     if (!hwnd) return 1;
 
-    if (optW > 0 && optH > 0) set_client_size(hwnd, optW, optH);
-    else                      set_client_size(hwnd, dp(780), chrome_height(dp(780)) + dp(210));
-
-    if (optNewDay) {
-        new_day();
-        if (optHour >= 0) g_cur = optHour;
-        g_barValid = FALSE;
-        refresh_text(TRUE);
-        mark(D_ALL);
+    if (s_opt_w > 0 && s_opt_h > 0) {
+        force_client_size(hwnd, s_opt_w, s_opt_h);
+        ShowWindow(hwnd, show == SW_SHOWMAXIMIZED ? SW_SHOWNORMAL : show);
+    } else if (!restore_placement(show)) {
+        set_client_size(hwnd, dp(1280), dp(860));
+        ShowWindow(hwnd, show);
     }
-    if (argv) LocalFree(argv);
 
-    ShowWindow(hwnd, show);
+    if (g.a.native.sound) {
+        if (!audio_set_enabled(true)) { g.sound_missing = true; g.a.native.sound = false; }
+    }
+    wind_sync(true);
+
+    {   /* first layout, then the optional scroll hook */
+        RECT cr; GetClientRect(hwnd, &cr);
+        if (cr.right > 0 && cr.bottom > 0) surf_resize(&g.back, cr.right, cr.bottom);
+        g_tgt = &g.back;
+        view_layout();
+        if (s_opt_scroll >= 0) view_scroll_to(s_opt_scroll);
+    }
+    ui_save_now();                       /* once at boot after load + clean (SPEC 6.3) */
+    title_sync();
+    if (s_boot_notice) {
+        char t[ALM_TOAST_CAP], n8[MAX_PATH * 3];
+        to_utf8(s_bad_name, n8, (int)sizeof n8);
+        if (s_boot_notice == 1)
+            snprintf(t, sizeof t, "<b>The saved almanac could not be read.</b> It was kept as <b>%.200s</b> next to it; a new almanac was started.", n8);
+        else if (s_boot_notice == 2)
+            snprintf(t, sizeof t, "<b>The saved almanac is in use by another program</b> and could not be opened. Nothing will be saved this session; close and reopen to try again.");
+        else
+            snprintf(t, sizeof t, "<b>The saved almanac could not be read</b> and could not be set aside. It was left untouched and nothing will be saved this session.");
+        toast_sticky(t);
+    }
+    ui_relayout();
     UpdateWindow(hwnd);
+    SetFocus(hwnd);
+    if (s_opt_open) PostMessageW(hwnd, WM_APP_HOOKS, 0, 0);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    cleanup();
+
+    view_free();
+    scene_free();
+    thumb_free();
+    img_free_all();
+    surf_free(&g.back);
+    fonts_free();
+    if (g.br_field) DeleteObject(g.br_field);
+    if (g.br_field_dis) DeleteObject(g.br_field_dis);
+    if (s_menu_br) DeleteObject(s_menu_br);
+    gdip_down();
+    alm_free(&g.a);
+    if (s_uxtheme) FreeLibrary(s_uxtheme);
+    if (s_mutex) CloseHandle(s_mutex);
+    free(s_opt_state);
+    free(s_opt_seed);
     return (int)msg.wParam;
 }

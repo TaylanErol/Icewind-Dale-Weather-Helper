@@ -1,4 +1,4 @@
-// Resources for Icewind Dale Weather Helper (native build).
+// Resources for the Icewind Dale Almanac (native build): icon, manifest, the 12 scenes.
 // Paths are resolved through windres --include-dir=src (see build.sh).
 #include <winver.h>
 
@@ -20,9 +20,25 @@
 111 RCDATA "../assets/w11.jpg"
 112 RCDATA "../assets/w12.jpg"
 
+// 360x120 copies for the timeline strip and calendar thumbnails (resource id = 200 + event
+// id), so a full scene is decoded only for the hero. Made by native/build.sh from w01..w12
+// when ImageMagick is present (assets/t01..t12.jpg).
+201 RCDATA "../assets/t01.jpg"
+202 RCDATA "../assets/t02.jpg"
+203 RCDATA "../assets/t03.jpg"
+204 RCDATA "../assets/t04.jpg"
+205 RCDATA "../assets/t05.jpg"
+206 RCDATA "../assets/t06.jpg"
+207 RCDATA "../assets/t07.jpg"
+208 RCDATA "../assets/t08.jpg"
+209 RCDATA "../assets/t09.jpg"
+210 RCDATA "../assets/t10.jpg"
+211 RCDATA "../assets/t11.jpg"
+212 RCDATA "../assets/t12.jpg"
+
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 2,0,0,0
-PRODUCTVERSION 2,0,0,0
+FILEVERSION 3,0,0,0
+PRODUCTVERSION 3,0,0,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS VOS_NT_WINDOWS32
@@ -33,12 +49,12 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "Icewind Dale Weather Helper"
-            VALUE "FileVersion", "2.0.0.0"
+            VALUE "FileDescription", "Icewind Dale Almanac - weather helper"
+            VALUE "FileVersion", "3.0.0.0"
             VALUE "InternalName", "IcewindDaleWeatherHelper"
             VALUE "OriginalFilename", "IcewindDaleWeatherHelper.exe"
-            VALUE "ProductName", "Icewind Dale Weather Helper"
-            VALUE "ProductVersion", "2.0.0.0"
+            VALUE "ProductName", "Icewind Dale Almanac"
+            VALUE "ProductVersion", "3.0.0.0"
         END
     END
     BLOCK "VarFileInfo"
