@@ -26,7 +26,21 @@ The **Icewind Dale Weather Helper** is a GUI-based tool designed to manage and t
 
 ---
 
-## Installation
+## Native Windows App
+
+The shipped program is a native Win32 app written in C (`native/`). It is a single ~600 KB exe with no Python or other runtime inside, starts instantly and uses no CPU while idle. The weather scenes are raster images embedded in the exe.
+
+- Ready-made exe: `release/IcewindDaleWeatherHelper.exe`
+- Build it yourself (needs `mingw-w64`): `native/build.sh`
+- Regenerate the scene images (needs `numpy` and `Pillow`): `python3 tools/gen_assets.py`
+
+Keys: Left/Right change the hour, Home/End jump to hour 0/23, N or F5 rolls a new day, Ctrl+C copies the description.
+
+`main.py` is the original Python/CustomTkinter version, kept for reference.
+
+---
+
+## Python Version (original)
 
 ### Prerequisites
 - Python 3.8+
