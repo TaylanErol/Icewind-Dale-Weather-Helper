@@ -28,13 +28,18 @@ The **Icewind Dale Weather Helper** is a GUI-based tool designed to manage and t
 
 ## Native Windows App
 
-The shipped program is a native Win32 app written in C (`native/`). It is a single ~600 KB exe with no Python or other runtime inside, starts instantly and uses no CPU while idle. The weather scenes are raster images embedded in the exe.
+The shipped program is a native Win32 app written in C (`native/`): a single ~1.4 MB exe with no Python or other runtime inside. It starts instantly and uses no CPU while idle. The weather scenes are raster images embedded in the exe.
+
+It combines the realistic scenes with the features of the "Almanac of the Everlasting Rime" web version: seeded weather that chains from day to day, the Harptos calendar with moon phases and festivals, temperature with the cold DC table (°F/°C), wind, severity, natural light and forecast, a 24-hour timeline with playback, the effects in play, a dice ledger, events, reminders and notes per day, settings, JSON backup import/export (compatible with the web version's backups) and a synthesised wind sound.
 
 - Ready-made exe: `release/IcewindDaleWeatherHelper.exe`
 - Build it yourself (needs `mingw-w64`): `native/build.sh`
+- Run the tests (needs `gcc` and `node`): `native/test/run.sh`
 - Regenerate the scene images (needs `numpy` and `Pillow`): `python3 tools/gen_assets.py`
 
-Keys: Left/Right change the hour, Home/End jump to hour 0/23, N or F5 rolls a new day, Ctrl+C copies the description.
+Main keys: Right or Space next hour, Left previous hour, N advance the day, Ctrl+Z step back, T today, E new event, O note, P play, U °F/°C, M sound, F2 settings, F1 all keys. Details are in `native/README.md` and `native/SPEC.md`.
+
+Your campaign is saved to `%APPDATA%\IcewindDaleAlmanac\`.
 
 `main.py` is the original Python/CustomTkinter version, kept for reference.
 
