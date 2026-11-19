@@ -1,0 +1,19 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [claude/eloquent-franklin-005c91]
+    paths: [native/**, Images/**, .github/workflows/build-exe.yml]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - run: native/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IcewindDaleWeatherHelper
+          path: native/build/IcewindDaleWeatherHelper.exe
