@@ -144,6 +144,17 @@ frigid #a9dcff, severe #9fbcff, extreme #cdb3ff, deathly #ffc2cf.
   full moon, Every tenday, Every month, Every year.
 * Event types: Natural #56e6b6, Unnatural #b897ff, Auril #e6f7ff, Reminder #ffc46b;
   sort priority auril, unnatural, natural, reminder, then anchor abs.
+* **Multi-day events** (native only): an event or reminder lasts `days` = 1..30 days
+  (default 1; 30 = one Harptos month, the longest unit the DM plans in, and it keeps every
+  per-day query a bounded loop). Each occurrence (any day `occursOn` accepts) covers that
+  day and the following `days − 1` calendar days, straight through month ends, festival
+  days, Shieldmeet and the year's end. All those days link to the SAME event: one title,
+  one details note, one id; editing or deleting it from any day changes the whole event.
+  Repeats compose: a 5-day festival repeating yearly shows its 5 days every year (anchored
+  on a festival: that festival + the next 4 days; on Shieldmeet: leap years only). When a
+  span is longer than its repeat interval (e.g. 15 days every tenday) the occurrences
+  overlap and each day belongs to the LATEST occurrence covering it: the event shows once
+  per day and its day count restarts at each new occurrence. Never before the anchor.
 
 ## 6. State, actions and persistence
 
@@ -152,7 +163,8 @@ specified in `store.h` (header comment). Summary of the state: seed, started, st
 dayCount, current (party's today, −1 = not begun), currentAbs, view (day on screen),
 selAbs (calendar selection), time (0..24), unit, moonOffset, yearNames, notes, events,
 ui {chainNoteHidden, calYear, calMonth}. Runtime: busy. Native-only, saved under "native"
-and never exported: window rect, sound, `ledger` (the dice ledger is open).
+and never exported: window rect, sound, `interior` (the sound is muffled as heard indoors),
+`ledger` (the dice ledger is open).
 
 **One home per fact** (native): every fact has one place on a screen and every function one
 visible control plus at most one key. Keys are taught in two places only: the control's
@@ -170,7 +182,8 @@ tooltip and the F1 card.
 | Timeline keys (focused) | web only: Right/Up +1 h, Left/Down −1 h, Home 0, End 23 → time = h + 0.5; Space/Enter = play/pause. Native: the time-step keys of 6.2 |
 | Play/Pause | web only: 1.25 s per game hour, then the Advance button pulses. Native: removed (manual time steps, 6.2) |
 | °F / °C toggle | unit, re-render, save |
-| Sound toggle | on/off; label "Sound on"/"Sound off"; "No audio" if unavailable. Not persisted (native: persisted) |
+| Sound toggle | on/off; web label "Sound on"/"Sound off". Native: always "Sound", a filled dot when on, a ring when off (as on Interior); "No audio" if unavailable. Tooltip "Howling wind ambience (M)", plus " · N playback gaps this session" once the device queue has run dry (`audio_underruns()` > 0). Not persisted (native: persisted) |
+| Interior (native) | chip right of Sound: muffles the sound as heard from inside a building (one overdamped low-pass, about −6 dB/oct from 250 Hz and −12 dB/oct above 2 kHz, 5..9 dB quieter with the howl still faintly audible, gentler gusts, a faint rumble; cross-fades in ~0.8 s). Sound only, never the weather. Enabled only while the sound plays (dimmed otherwise; tooltip "Muffle the wind, as heard indoors (I)", disabled "… (I) · turn the sound on first"); persisted in "native". Always labelled "Interior" |
 | Chain note X | web only (native: no chained-days note; Settings' seed help says it once; `chainNoteHidden` is kept untouched for the web) |
 | Calendar ‹ › | page months (wrapping years), debounced save |
 | Calendar "Today" | select(today ?? start); tooltip "Go to the current day" / "Go to the expedition start" |
@@ -215,7 +228,12 @@ The more modifier, the finer the step (layout independent).
 * **Auto-repeat** steps the clock, but a repeated key-down never crosses midnight: holding a
   key cannot run through days.
 * **Ctrl+Z** undoes the last move of today (advance, midnight step, make-today) and restores
-  that day's exact clock; one level. Within a day the opposite button is the undo.
+  that day's exact clock; one level. Within a day the opposite button is the undo. Native:
+  when an event deletion is the most recent undoable action, Ctrl+Z instead re-inserts a
+  copy of the deleted event with its id, anchor, type, repeat, details and days (toast
+  "<b>TITLE</b> restored", saved at once); the delete toast's second line reads "Ctrl+Z
+  restores it". A later advance, midnight step or make-today forgets the deletion; so do
+  Settings apply / import. F1: "Ctrl+Z — Undo the last day step or deletion".
 * **Rules per whole hour**: weather, temperature (the hour's value, not interpolated), tier
   / DC, wind, severity, natural light and effects read `hourNow()`. A 5 / 30 minute step
   inside an hour moves only the clock, the playhead, the chart dot, the forecast countdown
@@ -226,7 +244,8 @@ The more modifier, the finer the step (layout independent).
 * **PageUp / PageDown** or "‹ Previous day" / "Next day ›": view the previous / next day
   (stepDay). **T** or **Esc** (when nothing else is open) or the hero's "Back to today"
   pill: back to today. **E** / **O**: new event / note for the viewed day. **M**: sound
-  on/off. **F2**: Settings. **F1** or the "?" chip: the keys card (13 rows; any key or click
+  on/off. **I**: interior (muffled) while the sound is on. **F2**: Settings. **F1** or the
+  "?" chip: the keys card (14 rows; any key or click
   closes it). **Up / Down**, **Ctrl+Home / Ctrl+End**: scroll.
 * Removed (native): playback and **P**, **Home / End** (00:00 / 23:00), **Backspace** as
   undo, the **?** character, **Ctrl+,**, **Ctrl+C** (copy seed), **U** (unit: the header
@@ -259,6 +278,7 @@ replaces the old one; click dismisses.
 * "Beyond the almanac: at most 3650 days can be recorded." (setCurrent / day panel)
 * "Beyond the almanac: at most 3650 days of weather can be recorded." (select)
 * "<b>TITLE</b> added to the almanac" / "<b>TITLE</b> updated" / "<b>TITLE</b> removed"
+  (native, multi-day event: "<b>TITLE</b> removed · all 5 days")
 * "Weather regenerated from <b>DATE</b> · seed SEED"
 * "Backup restored · N day(s), M event(s)" (singular "day"/"event" for 1)
 
@@ -276,7 +296,8 @@ replaces the old one; click dismisses.
   then the pill "Began this hour" when the event changed at this hour.
   Native: no clock, no light badge and no aurora badge here (the light lives in the stats,
   the clock in the controls).
-* Marks of that day as chips (built-in first).
+* Marks of that day as chips (built-in first). Native: a multi-day event's chip reads
+  "<title> · day 2 of 5" (once, on every day of its span); the day toast's chips likewise.
 * Event name (largest text), flavour (italic, secondary). No tooltip on the name.
 * Temperature: big number `minus(toUnit(tempF))` (the hour's value), unit "°F"/"°C" and the
   tier pill "<Tier name> DC <dc>" (tier in body text, DC bold), tooltip "Cold table: DC
@@ -387,6 +408,14 @@ Secondary content lives below or beside the live weather and never covers it.
   (strong bright border + "Today" tag), selected (bright border), before start (40%
   opacity), new moon (lighter top glow), start (aurora-green left edge + "Start" tag).
   Native: no extra underline in the first event's colour (the chip rule carries it).
+  Native lanes: the two chip lines are lanes kept per tenday row. Multi-day events get the
+  top lanes (longer runs first), then one-day events in priority order. A span is one
+  tinted bar in its type colour joined across the cells (and the gaps) of the row, with the
+  type rule only on its first day; its title is drawn once per row on the run's first cell,
+  across the run; a small chevron marks an end that goes on beyond the row (or a festival
+  cell). The bar runs through the Today frame. Events beyond two lanes show "+N" next to the
+  moon disc. Cell tooltips add "(day 2 of 5)" to a span's title. Native: a festival cell's tooltip does not
+  append the web aria-label's ", festival" (its date already names the festival).
 * Click selects, double-click sets today (Ctrl+Z steps back). Native: no keyboard grid
   mode, no right-click menu, no legend or hint row (colours are learnt in the event form;
   cell tooltips name everything). The "Today" button has no key cap (tooltip "Go to the
@@ -397,7 +426,9 @@ Secondary content lives below or beside the live weather and never covers it.
 "Upcoming" + note ("next ten days from today" / "from the expedition start"); items with
 rel ("Tomorrow", "In 3 days") + short date + chips; empty "Nothing marked for the next ten
 days.". Click selects. Native: today's own row is skipped (today's marks are on the hero
-and in the day panel).
+and in the day panel). A multi-day event is listed once, on the row of the day it starts,
+its chip "<title> · 5 days"; days whose only marks are spans already under way get no row
+(on the first row, when there is no today, a span under way reads "<title> · day 2 of 5").
 
 ### 8.3 Day panel (selected day)
 
@@ -413,14 +444,28 @@ date, sub, moon line or weather box; `alm_day_panel` still provides them). In or
    the form is open; tooltip "New event or reminder on this day (E)"): marks list; user
    events show title, meta (`alm_fmt_mark_meta`), details, Edit and Delete (tooltip
    "Delete" or "Delete (all occurrences)" for repeats). Delete is two-step: first press arms
-   (red, tooltip "Press again to delete"), auto-disarms after 3 s. Empty: "None on this
+   (red, tooltip "Press again to delete"), auto-disarms after 3 s. Multi-day event: the meta
+   ends "· Day 2 of 5 · 4–8 Hammer" (`alm_fmt_span_range`; no-break spaces inside each
+   date, so a date never wraps) and the row shows the shared details; Edit's
+   tooltip is "Edit (all 5 days)"; Delete's "Delete (all 5 days)", and armed it becomes one
+   wide red "Delete all 5 days?" button over Edit + Delete; the toast reads
+   "<b>TITLE</b> removed · all 5 days". Empty: "None on this
    day.". The event form opens in place, under the list:
 
    Event form (inline, not modal): title "New event or reminder" / "Edit event"; Title
    (max 120, placeholder "e.g. Auril's followers attack Bryn Shander", required: empty
    title marks the field invalid and refocuses); Type radio Natural/Unnatural/Auril/Reminder
    (native default: the last type used, first Reminder); Repeat select (labels above,
-   default Never); Details (optional, multiline, max 2000); buttons "Cancel" and "Add to the
+   default Never); native: "Lasts [n] days" beside Repeat (under it when narrow): a 2-digit
+   number field with − / + steppers (Up / Down in the field; tooltips teach them), default
+   1, the stored length when editing. The line under the stepper is always reserved (the
+   form never jumps): muted, the days the event covers from its first day (selAbs for a new
+   event, the start of the selected day's occurrence when editing), `alm_fmt_span_range`:
+   "5 Hammer", "5–9 Hammer", "30 Hammer – 1 Alturiak", "30 Hammer – Midwinter"; anything but
+   1..30 replaces it with "1 to 30 days" in red, marks the field red and refocuses it on
+   submit. Editing a multi-day event shows a muted line under the form title: "Day 3 of 5 ·
+   changes apply to the whole event" (fallback "Changes apply to the whole event"). Tab order Title →
+   Lasts → Details; Enter in Lasts submits. Details (optional, multiline, max 2000); buttons "Cancel" and "Add to the
    almanac" / "Save changes". Esc cancels. New events anchor on selAbs; edits keep their
    anchor and id. Selecting another day closes an unsaved *new* event form.
 4. Notes: label "Notes" + state "editing…" / "saved"; multiline, placeholder "What happened
@@ -475,9 +520,11 @@ Arrangement (native, at 1280×860 everything below up to the calendar head is ab
 fold):
 
 1. Header row (42 px): app name (small caps, restrained) + subtitle, or the live readout
-   "<date> · HH:MM · <event> · <temp> · <tier> DC n" (just "DC n" when tight; amber tag
-   while another day is viewed) once the hero is scrolled away; at the right "?", °F/°C,
-   Sound, Settings. No seed chip.
+   "<date> · HH:MM · <event> · <temp> · <tier> DC n" (amber tag while another day is
+   viewed). It fits by priority: first the tier's name goes ("DC n" stays), then the date,
+   then the clock; if event · temp · DC still does not fit, only the event name is
+   ellipsised (left out rather than drawn as a lone "…") once the hero is scrolled away; at the right "?", °F/°C,
+   Sound, Interior, Settings. No seed chip.
 2. Wide (≥ 940 px): left ~56%: the hero (scene with the date line, event name, flavour,
    temperature and tier pill), the timeline, then the calendar (grid + Upcoming). Right
    ~44%: controls (Advance + time steps, constant 112 px), stats (Wind / Severity /
@@ -544,6 +591,10 @@ only when the hour/event changes):
   gradient/scrim.
 
 Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see audio.h.
+Native playback must never gap: the device queue holds ~280 ms in 8 buffers, refilled by a
+high-priority thread woken by the device (never by the UI thread); the synthesis never dips
+toward silence (gust depth grows with the wind: 0.63..0.79 of the mean-0.71 envelope in calm
+air, 0.42..1 at full wind; a steady bed at No Wind; no looped noise table).
 
 ## 12. Ambiguities resolved / native deviations
 
@@ -558,8 +609,8 @@ Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see 
 3. **Playback** is removed (web: Play/Pause at 1.25 s per game hour); the DM steps time by
    hand (6.2). The Advance button therefore never "beckons".
 4. **Save file** instead of localStorage; v1 detection by content (`v` absent or 1),
-   extra "native" key (ignored by the web, never exported); sound preference and the dice
-   ledger's open state persisted.
+   extra "native" key (ignored by the web, never exported); sound and interior preferences
+   and the dice ledger's open state persisted.
 5. **Seed upper-casing** uses 1:1 case mapping (no 'ß' -> "SS"); seeds imported from a
    backup are kept verbatim, so parity holds for imported campaigns.
 6. **Date range**: abs/year limited to years −99999..99999; out-of-range stored values
@@ -568,6 +619,15 @@ Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see 
 8. **Export file name** sanitises characters Windows forbids.
 9. **Notes**: native caps a single note at 256 KiB (web unlimited); events capped at
    20000.
+9a. **Multi-day events** (5, 8.1-8.3): the event key `"days"` (integer 2..30) is
+    native only. It is written last in the event object and only when above 1, so a save or
+    backup whose events all last one day stays byte-identical to the web's. On load/import:
+    an integer is clamped to 1..30; 0, negatives, fractions, strings, booleans, null,
+    arrays or objects mean 1; a missing key means 1 (old files and web backups import
+    unchanged). The web app's `cleanEvent` rebuilds every event from a fixed key list, so it
+    silently drops `"days"` when it imports a native backup: there the event becomes a one-day
+    event on its first day (title, details, type, repeat and id survive). Nothing else is
+    lost.
 10. **Multi-tab merge** (web `storage` event) is not applicable.
 11. **Screen-reader announcement** (`announce`) is kept in the store but not shown (native:
     no live window title and no tooltip on the event name; the window title is constant).
@@ -594,3 +654,11 @@ Wind sound: the wind level is the look's `wind` of the viewed hour (eased); see 
   note keys "012", "-3", "x"; events with bad type/repeat, blank title, long title with
   emoji), re-serialise and compare with JSON.stringify output byte for byte; export ->
   import round trip; v1 migration.
+* Multi-day events (`test_spans` in `test_store.c`): JSON round trip ("days" last, omitted
+  at 1, snapshot byte-identical after reload, export/import), spans across a month end into
+  Midwinter and across the year end, yearly / festival-anchored / Shieldmeet / monthly /
+  tenday / new-moon repeats with spans, overlapping occurrences (latest wins, shown once),
+  Upcoming de-duplication and chip texts, cell label, editing from a middle day (anchor,
+  length and shared details kept), deleting from day 4 clears all days, old files without
+  the key, API clamping, hostile "days" values (0, −3, 31, 1e300, −1e300, 2.5, "5", true,
+  null, [5], {}, 5.0, 2^32+5) and spans at the abs limits.

@@ -221,6 +221,7 @@ static void test_round_trip(const char *tmpdir)
     a.moon_offset = 2.5;
     a.started = NOW - 5000;
     a.native.sound = true;
+    a.native.interior = true;
     a.native.has_rect = true;
     a.native.win_x = -8; a.native.win_y = 20; a.native.win_w = 1280; a.native.win_h = 760;
     a.native.maximized = true;
@@ -248,7 +249,7 @@ static void test_round_trip(const char *tmpdir)
     CHECK(alm_load_file(&b, path) == ALM_LOAD_OK, "load");
     char *s1 = snap(&a, true), *s2 = snap(&b, true);
     CHECK_STR(s2, s1);
-    CHECK(b.native.sound && b.native.has_rect && b.native.win_x == -8 && b.native.win_w == 1280 && b.native.maximized &&
+    CHECK(b.native.sound && b.native.interior && b.native.has_rect && b.native.win_x == -8 && b.native.win_w == 1280 && b.native.maximized &&
           b.native.ledger, "native prefs");
     CHECK(b.n_days == 10 && memcmp(a.days, b.days, sizeof(IwdDay) * 10) == 0, "days rebuilt identically");
     CHECK(b.chain.rng_state == a.chain.rng_state, "chain state");
@@ -257,7 +258,8 @@ static void test_round_trip(const char *tmpdir)
     /* export never carries "native"; import keeps the importer's native prefs */
     AlmBuf ex = {0};
     CHECK(alm_export_json(&a, ISO, &ex), "export");
-    CHECK(strstr(ex.data, "\"native\"") == NULL && strstr(ex.data, "ledger") == NULL, "export has no native");
+    CHECK(strstr(ex.data, "\"native\"") == NULL && strstr(ex.data, "ledger") == NULL &&
+          strstr(ex.data, "interior") == NULL, "export has no native");
     CHECK(strncmp(ex.data, "{\n  \"app\": \"icewind-dale-almanac\",\n  \"exported\": \"2026-11-19T18:04:05.123Z\",\n  \"v\": 2,", 80) == 0,
           "export head");
     Almanac c;
@@ -267,7 +269,7 @@ static void test_round_trip(const char *tmpdir)
     CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_BUSY, "import busy");
     c.busy = false;
     CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_OK, "import");
-    CHECK(c.native.ledger && !c.native.sound, "import keeps native prefs");
+    CHECK(c.native.ledger && !c.native.sound && !c.native.interior, "import keeps native prefs");
     s1 = snap(&a, false); s2 = snap(&c, false);
     CHECK_STR(s2, s1);
     free(s1); free(s2);
@@ -394,7 +396,7 @@ static void test_actions(void)
           "cell tags");
     CHECK(cells[30].is_sel && cells[0].has_weather && cells[29].has_weather && a.n_days == 31, "cell states (select rolled up to the festival)");
     alm_fmt_cell_label(&a, &cells[30], buf, sizeof buf);
-    CHECK(strncmp(buf, "Midwinter, 1489 DR \xC2\xB7 ", 21) == 0 && strstr(buf, ", festival"), "label %s", buf);
+    CHECK(strncmp(buf, "Midwinter, 1489 DR \xC2\xB7 ", 21) == 0 && !strstr(buf, ", festival"), "label %s", buf);
 
     /* calendar paging */
     for (int i = 0; i < 12; i++) alm_cal_step(&a, 1);
@@ -821,6 +823,326 @@ static void test_fuzz(const char *cases_path)
     printf("  fuzz: %d documents\n", runs);
 }
 
+/* ------------------------------------------------------------------ multi-day spans */
+
+static int32_t A(int32_t y, int m, int d)
+{
+    int32_t v = 0;
+    if (!iwd_to_abs(y, m, d, IWD_FEST_NONE, &v)) { fprintf(stderr, "bad date\n"); exit(2); }
+    return v;
+}
+static int32_t F(int32_t y, IwdFestival f)
+{
+    int32_t v = 0;
+    if (!iwd_to_abs(y, 0, 1, f, &v)) { fprintf(stderr, "bad festival\n"); exit(2); }
+    return v;
+}
+/* days in [from, to] the event is on, as a bitstring "1100..." */
+static void on_string(const Almanac *a, const AlmEvent *e, int32_t from, int32_t to, char *out)
+{
+    int k = 0;
+    for (int32_t d = from; d <= to; d++) out[k++] = alm_event_span_day(e, d, a->moon_offset, NULL) >= 0 ? '1' : '0';
+    out[k] = 0;
+}
+static const AlmEvent *last_ev(const Almanac *a) { return &a->events[a->n_events - 1]; }
+
+static void test_spans(void)
+{
+    Almanac a;
+    bool upd;
+    char s[512], buf[512];
+    alm_init(&a, 77);
+
+    /* span range texts (form line, day panel meta) */
+    alm_fmt_span_range(A(1489, 0, 5), 1, buf, sizeof buf);
+    CHECK_STR(buf, "5\xC2\xA0" "Hammer");
+    alm_fmt_span_range(A(1489, 0, 5), 5, buf, sizeof buf);
+    CHECK_STR(buf, "5\xE2\x80\x93" "9\xC2\xA0" "Hammer");
+    alm_fmt_span_range(A(1489, 0, 30), 3, buf, sizeof buf);
+    CHECK_STR(buf, "30\xC2\xA0" "Hammer \xE2\x80\x93 1\xC2\xA0" "Alturiak");
+    alm_fmt_span_range(A(1489, 0, 30), 2, buf, sizeof buf);
+    CHECK_STR(buf, "30\xC2\xA0" "Hammer \xE2\x80\x93 Midwinter");
+    alm_fmt_span_range(F(1489, IWD_FEST_MIDWINTER), 1, buf, sizeof buf);
+    CHECK_STR(buf, "Midwinter");
+    alm_fmt_span_range(A(1489, 10, 30), 2, buf, sizeof buf);   /* "Feast of the Moon": no-break spaces */
+    CHECK(strstr(buf, "Moon") && strstr(buf, "Feast") && !strstr(buf, "of the"), "festival name keeps no-break spaces: %s", buf);
+    alm_fmt_span_range(A(1489, 0, 5), 99, buf, sizeof buf);    /* clamped to 30 days */
+    CHECK_STR(buf, "5\xC2\xA0" "Hammer \xE2\x80\x93 3\xC2\xA0" "Alturiak");
+    CHECK(alm_fmt_span_range(IWD_ABS_MAX, 5, buf, sizeof buf) > 0 && !strstr(buf, "\xE2\x80\x93"), "range at the edge: %s", buf);
+    CHECK(alm_fmt_span_range(IWD_ABS_MAX - 1, 5, buf, sizeof buf) > 0 && strstr(buf, "\xE2\x80\x93"), "range near the edge: %s", buf);
+
+    /* undo of a deletion: the copy comes back with its id, anchor, details and days, in place */
+    {
+        Almanac u;
+        AlmEvent cp;
+        alm_init(&u, 5);
+        alm_event_save_span(&u, NULL, A(1489, 0, 3), "First", ALM_EV_AURIL, IWD_REPEAT_YEARLY, "", 1, NOW, &upd);
+        alm_event_save_span(&u, NULL, A(1489, 0, 5), "Fair", ALM_EV_NATURAL, IWD_REPEAT_YEARLY, "Stalls on the ice", 5, NOW + 1, &upd);
+        alm_event_save_span(&u, NULL, A(1489, 0, 7), "Last", ALM_EV_REMINDER, IWD_REPEAT_NONE, "", 1, NOW + 2, &upd);
+        char id[64];
+        snprintf(id, sizeof id, "%s", u.events[1].id);
+        CHECK(alm_event_index(&u, id) == 1 && alm_event_index(&u, "nope") == -1, "event index");
+        CHECK(alm_event_dup(&cp, &u.events[1]), "dup");
+        AlmResult r = alm_event_delete(&u, id);
+        CHECK(u.n_events == 2 && !alm_event_find(&u, id) && strstr(r.toast, "all 5 days"), "deleted: %s", r.toast);
+        r = alm_event_restore(&u, &cp, 1);
+        CHECK(!(r.fx & ALM_FX_REJECTED) && (r.fx & ALM_FX_SAVE) && strstr(r.toast, "<b>Fair</b> restored"), "restored: %s", r.toast);
+        CHECK(u.n_events == 3 && strcmp(u.events[1].id, id) == 0 && u.events[1].abs == A(1489, 0, 5) &&
+              u.events[1].days == 5 && u.events[1].repeat == IWD_REPEAT_YEARLY && u.events[1].type == ALM_EV_NATURAL &&
+              strcmp(u.events[1].details, "Stalls on the ice") == 0 && strcmp(u.events[2].title, "Last") == 0,
+              "restored in place with everything");
+        CHECK(alm_event_span_day(&u.events[1], A(1490, 0, 9), 0, NULL) == 4, "restored span works");
+        r = alm_event_restore(&u, &cp, 0);
+        CHECK((r.fx & ALM_FX_REJECTED) && u.n_events == 3, "restoring twice is rejected");
+        alm_event_release(&cp);
+        CHECK(cp.id == NULL && cp.title == NULL, "release clears");
+        alm_free(&u);
+    }
+
+    /* one-time 5-day festival: days 1..5 of the same event, nothing before or after */
+    int32_t s0 = A(1489, 2, 10);
+    alm_event_save_span(&a, NULL, s0, "Festival of Ice", ALM_EV_NATURAL, IWD_REPEAT_NONE, "Lanterns on the lake", 5, NOW, &upd);
+    CHECK(a.n_events == 1 && a.events[0].days == 5, "span saved");
+    on_string(&a, &a.events[0], s0 - 2, s0 + 7, s);
+    CHECK_STR(s, "0011111000");
+    for (int k = 0; k < 5; k++) {
+        AlmMark mk[4]; int32_t st = 0;
+        int n = alm_marks_on(&a, s0 + k, mk, 4);
+        int j = n > 0 && mk[0].builtin ? 1 : 0;
+        CHECK(n >= 1 && mk[j].event == &a.events[0] && mk[j].span_day == k && mk[j].span_len == 5 && mk[j].span_start == s0,
+              "mark day %d", k);
+        CHECK(alm_event_span_day(&a.events[0], s0 + k, 0, &st) == k && st == s0, "span day %d", k);
+    }
+    {
+        AlmMark mk[4];
+        int n = alm_marks_on(&a, s0 + 1, mk, 4), j = mk[0].builtin ? 1 : 0;
+        CHECK(n >= 1, "marks");
+        alm_fmt_mark_meta(&mk[j], s0 + 1, buf, sizeof buf);
+        CHECK_STR(buf, "Natural \xC2\xB7 One-time \xC2\xB7 Day 2 of 5 \xC2\xB7 10\xE2\x80\x93" "14\xC2\xA0" "Ches");
+        alm_fmt_mark_chip(&mk[j], false, buf, sizeof buf);
+        CHECK_STR(buf, "Festival of Ice \xC2\xB7 day 2 of 5");
+        alm_fmt_mark_chip(&mk[j], true, buf, sizeof buf);   /* not the first day: still "day k of n" */
+        CHECK_STR(buf, "Festival of Ice \xC2\xB7 day 2 of 5");
+    }
+
+    /* JSON: key written after details only when > 1; single-day events byte-identical */
+    {
+        char *j1 = snap(&a, false);
+        CHECK(strstr(j1, "\"details\":\"Lanterns on the lake\",\"days\":5}") != NULL, "days key written last");
+        free(j1);
+        alm_event_save(&a, NULL, s0, "One day", ALM_EV_REMINDER, IWD_REPEAT_NONE, "", NOW, &upd);
+        CHECK(last_ev(&a)->days == 1, "alm_event_save defaults to 1 day");
+        j1 = snap(&a, false);
+        CHECK(strstr(j1, "\"title\":\"One day\",\"type\":\"reminder\",\"repeat\":\"none\",\"details\":\"\"}") != NULL,
+              "no days key at 1");
+        Almanac b; alm_init(&b, 3);
+        CHECK(alm_load_json(&b, j1, strlen(j1)) == ALM_LOAD_OK && b.n_events == 2 && b.events[0].days == 5 && b.events[1].days == 1,
+              "span round trip");
+        char *j2 = snap(&b, false);
+        CHECK(strcmp(j1, j2) == 0, "span snapshot byte-identical after reload");
+        free(j2);
+        AlmBuf ex = {0};
+        CHECK(alm_export_json(&b, ISO, &ex) && strstr(ex.data, "\"days\": 5") != NULL, "export keeps days");
+        Almanac c; alm_init(&c, 4);
+        CHECK(alm_import_json(&c, ex.data, ex.len, NOW) == ALM_IMPORT_OK && c.n_events == 2 && c.events[0].days == 5, "import days");
+        alm_buf_free(&ex);
+        alm_free(&c);
+        alm_free(&b);
+        free(j1);
+        alm_event_delete(&a, last_ev(&a)->id);
+    }
+
+    /* editing from a middle day changes the one event; days kept by alm_event_save */
+    {
+        char id[64];
+        snprintf(id, sizeof id, "%s", a.events[0].id);
+        alm_select(&a, s0 + 2, true);
+        alm_event_save_span(&a, id, a.sel_abs, "Festival of Ice", ALM_EV_NATURAL, IWD_REPEAT_NONE, "Moved to the shore", 0, NOW, &upd);
+        CHECK(upd && a.n_events == 1 && a.events[0].abs == s0 && a.events[0].days == 5, "edit from day 3 keeps anchor and length");
+        for (int k = 0; k < 5; k++) {
+            const AlmEvent *ev[2];
+            CHECK(alm_events_on(&a, s0 + k, ev, 2) == 1 && strcmp(ev[0]->details, "Moved to the shore") == 0, "shared details %d", k);
+        }
+        alm_event_save(&a, id, 0, "Festival of Ice", ALM_EV_NATURAL, IWD_REPEAT_NONE, "x", NOW, &upd);
+        CHECK(a.events[0].days == 5, "plain save keeps days");
+        alm_event_save_span(&a, id, 0, "Festival of Ice", ALM_EV_NATURAL, IWD_REPEAT_NONE, "x", 3, NOW, &upd);
+        on_string(&a, &a.events[0], s0, s0 + 5, s);
+        CHECK_STR(s, "111000");
+        alm_event_save_span(&a, id, 0, "Festival of Ice", ALM_EV_NATURAL, IWD_REPEAT_NONE, "x", 5, NOW, &upd);
+        /* delete from day 4: every day clears */
+        const AlmEvent *ev[2];
+        CHECK(alm_events_on(&a, s0 + 3, ev, 2) == 1, "on day 4");
+        AlmResult r = alm_event_delete(&a, ev[0]->id);
+        CHECK(strstr(r.toast, "removed \xC2\xB7 all 5 days") != NULL, "delete toast names the span: %s", r.toast);
+        for (int k = 0; k < 5; k++) CHECK(alm_events_on(&a, s0 + k, NULL, 0) == 0, "cleared day %d", k);
+    }
+
+    /* limits: clamp in the API */
+    alm_event_save_span(&a, NULL, s0, "Big", ALM_EV_NATURAL, IWD_REPEAT_NONE, "", 999, NOW, &upd);
+    CHECK(last_ev(&a)->days == ALM_EVENT_DAYS_MAX, "api clamps to max");
+    alm_event_save_span(&a, NULL, s0, "Neg", ALM_EV_NATURAL, IWD_REPEAT_NONE, "", -4, NOW, &upd);
+    CHECK(last_ev(&a)->days == 1, "api: negative -> 1");
+    while (a.n_events) alm_event_delete(&a, a.events[0].id);
+
+    /* across month end into a festival, and across the year end */
+    {
+        int32_t m0 = A(1489, 0, 29);           /* 29 Hammer, 30 Hammer, Midwinter, 1 Alturiak, 2 Alturiak */
+        alm_event_save_span(&a, NULL, m0, "Thaw", ALM_EV_NATURAL, IWD_REPEAT_NONE, "", 5, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), F(1489, IWD_FEST_MIDWINTER), 0, NULL) == 2, "festival is day 3");
+        CHECK(alm_event_span_day(last_ev(&a), A(1489, 1, 2), 0, NULL) == 4, "2 Alturiak is day 5");
+        CHECK(alm_event_span_day(last_ev(&a), A(1489, 1, 3), 0, NULL) < 0, "3 Alturiak not");
+        int32_t y0 = A(1489, 11, 29);          /* 29, 30 Nightal, 1, 2 Hammer 1490 */
+        alm_event_save_span(&a, NULL, y0, "Year turn", ALM_EV_AURIL, IWD_REPEAT_NONE, "", 4, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), A(1490, 0, 2), 0, NULL) == 3, "year end crossing");
+        AlmMark mk[4];
+        int n = alm_marks_on(&a, A(1490, 0, 1), mk, 4), j = n > 0 && mk[0].builtin ? 1 : 0;
+        CHECK(n >= 1, "marks");
+        alm_fmt_mark_meta(&mk[j], A(1490, 0, 1), buf, sizeof buf);
+        CHECK_STR(buf, "Auril \xC2\xB7 One-time \xC2\xB7 Day 3 of 4 \xC2\xB7 29\xC2\xA0" "Nightal \xE2\x80\x93 2\xC2\xA0" "Hammer");
+        while (a.n_events) alm_event_delete(&a, a.events[0].id);
+    }
+
+    /* yearly repeat: 5 days every year, also when anchored on a festival / Shieldmeet */
+    {
+        alm_event_save_span(&a, NULL, s0, "Yearly", ALM_EV_NATURAL, IWD_REPEAT_YEARLY, "", 5, NOW, &upd);
+        for (int32_t y = 1489; y <= 1493; y++) {
+            on_string(&a, last_ev(&a), A(y, 2, 9), A(y, 2, 15), s);
+            CHECK_STR(s, "0111110");
+        }
+        on_string(&a, last_ev(&a), A(1488, 2, 9), A(1488, 2, 15), s);
+        CHECK_STR(s, "0000000");              /* never before the anchor */
+        int32_t mw = F(1489, IWD_FEST_MIDWINTER);
+        alm_event_save_span(&a, NULL, mw, "Midwinter fair", ALM_EV_REMINDER, IWD_REPEAT_YEARLY, "", 3, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), A(1491, 1, 2), 0, NULL) == 2 &&
+              alm_event_span_day(last_ev(&a), A(1491, 1, 3), 0, NULL) < 0 &&
+              alm_event_span_day(last_ev(&a), A(1491, 0, 30), 0, NULL) < 0, "festival-anchored yearly span");
+        int32_t sm = F(1492, IWD_FEST_SHIELDMEET);
+        alm_event_save_span(&a, NULL, sm, "Shieldmeet games", ALM_EV_REMINDER, IWD_REPEAT_YEARLY, "", 2, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), A(1492, 7, 1), 0, NULL) == 1, "Shieldmeet + 1 Eleasis");
+        CHECK(alm_event_span_day(last_ev(&a), A(1493, 7, 1), 0, NULL) < 0, "no Shieldmeet in 1493: no span");
+        CHECK(alm_event_span_day(last_ev(&a), A(1496, 7, 1), 0, NULL) == 1, "next leap year");
+        while (a.n_events) alm_event_delete(&a, a.events[0].id);
+    }
+
+    /* monthly and tenday repeats; a span longer than the interval: latest occurrence wins */
+    {
+        alm_event_save_span(&a, NULL, A(1489, 0, 28), "Monthly", ALM_EV_NATURAL, IWD_REPEAT_MONTHLY, "", 4, NOW, &upd);
+        /* 28 Hammer .. Midwinter .. 1 Alturiak; then 28 Alturiak .. 1 Ches */
+        CHECK(alm_event_span_day(last_ev(&a), F(1489, IWD_FEST_MIDWINTER), 0, NULL) == 3 &&
+              alm_event_span_day(last_ev(&a), A(1489, 1, 1), 0, NULL) < 0 &&
+              alm_event_span_day(last_ev(&a), A(1489, 2, 1), 0, NULL) == 3, "monthly span over a festival");
+        alm_event_save_span(&a, NULL, A(1489, 0, 1), "Tenday x3", ALM_EV_NATURAL, IWD_REPEAT_TENDAY, "", 3, NOW, &upd);
+        on_string(&a, last_ev(&a), A(1489, 0, 1), A(1489, 0, 20), s);
+        CHECK_STR(s, "11100000001110000000");
+        alm_event_save_span(&a, NULL, A(1489, 0, 1), "Tenday x15", ALM_EV_NATURAL, IWD_REPEAT_TENDAY, "", 15, NOW, &upd);
+        const AlmEvent *e = last_ev(&a);
+        CHECK(alm_event_span_day(e, A(1489, 0, 11), 0, NULL) == 0 && alm_event_span_day(e, A(1489, 0, 15), 0, NULL) == 4,
+              "overlap restarts at the newer occurrence");
+        CHECK(alm_event_span_day(e, F(1489, IWD_FEST_MIDWINTER), 0, NULL) == 10, "festival: day 11 of the 21 Hammer occurrence");
+        {
+            const AlmEvent *ev[8];
+            int n = alm_events_on(&a, A(1489, 0, 15), ev, 8), cnt = 0;
+            for (int i = 0; i < n; i++) if (ev[i] == e) cnt++;
+            CHECK(cnt == 1, "overlapping occurrences show once per day");
+        }
+        while (a.n_events) alm_event_delete(&a, a.events[0].id);
+    }
+
+    /* new-moon repeat: every new moon starts a span */
+    {
+        int32_t nm = 0;
+        for (int32_t d = A(1489, 0, 1); d < A(1489, 0, 1) + 40; d++) if (iwd_moon(d, 0).is_new) { nm = d; break; }
+        CHECK(nm != 0, "new moon found");
+        alm_event_save_span(&a, NULL, nm, "Dark nights", ALM_EV_AURIL, IWD_REPEAT_NEWMOON, "", 3, NOW, &upd);
+        int32_t next = 0;
+        for (int32_t d = nm + 20; d < nm + 40; d++) if (iwd_moon(d, 0).is_new) { next = d; break; }
+        CHECK(alm_event_span_day(last_ev(&a), next + 2, 0, NULL) == 2 && alm_event_span_day(last_ev(&a), next + 3, 0, NULL) < 0,
+              "new-moon span");
+        while (a.n_events) alm_event_delete(&a, a.events[0].id);
+    }
+
+    /* Upcoming: a span shows once, where it starts; days with only continuing spans have no row */
+    {
+        Almanac u; alm_init(&u, 5);
+        alm_advance(&u, 12);                     /* begin: today = start */
+        int32_t today = 0;
+        CHECK(alm_today_abs(&u, &today), "today");
+        alm_event_save_span(&u, NULL, today + 2, "Fair", ALM_EV_REMINDER, IWD_REPEAT_NONE, "", 5, NOW, &upd);
+        alm_event_save_span(&u, NULL, today - 1, "Ongoing", ALM_EV_NATURAL, IWD_REPEAT_NONE, "", 4, NOW, &upd);
+        AlmUpcoming up[ALM_UPCOMING_DAYS + 1];
+        int n = alm_upcoming(&u, up), fair = 0, ongoing = 0;
+        for (int i = 0; i < n; i++) {
+            AlmMark mk[16];
+            int m = alm_upcoming_marks(&u, &up[i], mk, 16);
+            CHECK(m == up[i].n_marks, "n_marks matches");
+            for (int k = 0; k < m && k < 16; k++) {
+                if (mk[k].builtin) continue;
+                if (strcmp(mk[k].title, "Fair") == 0) {
+                    fair++;
+                    CHECK(up[i].abs == today + 2 && mk[k].span_day == 0, "fair on its first day");
+                    alm_fmt_mark_chip(&mk[k], true, buf, sizeof buf);
+                    CHECK_STR(buf, "Fair \xC2\xB7 5 days");
+                }
+                if (strcmp(mk[k].title, "Ongoing") == 0) {
+                    ongoing++;
+                    CHECK(up[i].rel_days == 0 && mk[k].span_day == 1, "in-progress span only on the base row");
+                    alm_fmt_mark_chip(&mk[k], true, buf, sizeof buf);
+                    CHECK_STR(buf, "Ongoing \xC2\xB7 day 2 of 4");
+                }
+            }
+        }
+        CHECK(fair == 1 && ongoing == 1, "upcoming de-duplicated (fair %d, ongoing %d)", fair, ongoing);
+        /* the day toast and cell label of a middle day */
+        AlmCell cells[32];
+        int nc = alm_month_cells(&u, cells);
+        for (int i = 0; i < nc; i++)
+            if (cells[i].abs == today + 3) {
+                alm_fmt_cell_label(&u, &cells[i], buf, sizeof buf);
+                CHECK(strstr(buf, "Fair (day 2 of 5)") != NULL, "cell label: %s", buf);
+            }
+        alm_free(&u);
+    }
+
+    /* JSON hostile values for "days" */
+    {
+        static const struct { const char *v; int want; } H[] = {
+            { "0", 1 }, { "-3", 1 }, { "1", 1 }, { "2", 2 }, { "30", 30 }, { "31", 30 }, { "1e300", 30 },
+            { "-1e300", 1 }, { "2.5", 1 }, { "\"5\"", 1 }, { "true", 1 }, { "null", 1 }, { "[5]", 1 }, { "{}", 1 },
+            { "5.0", 5 }, { "4294967301", 30 },
+        };
+        for (size_t i = 0; i < sizeof H / sizeof H[0]; i++) {
+            char doc[512];
+            snprintf(doc, sizeof doc, "{\"v\":2,\"seed\":\"X\",\"events\":[{\"id\":\"e1\",\"abs\":%ld,\"title\":\"T\","
+                     "\"days\":%s}]}", (long)s0, H[i].v);
+            Almanac b; alm_init(&b, 9);
+            CHECK(alm_load_json(&b, doc, strlen(doc)) == ALM_LOAD_OK && b.n_events == 1 && b.events[0].days == H[i].want,
+                  "days %s -> %d (got %d)", H[i].v, H[i].want, b.n_events ? b.events[0].days : -99);
+            char *j = snap(&b, false);
+            CHECK((H[i].want > 1) == (strstr(j, "\"days\"") != NULL), "days key presence for %s", H[i].v);
+            free(j);
+            alm_free(&b);
+        }
+        /* an old file without the key: one-day events */
+        char doc[256];
+        snprintf(doc, sizeof doc, "{\"v\":2,\"seed\":\"X\",\"events\":[{\"id\":\"e1\",\"abs\":%ld,\"title\":\"T\"}]}", (long)s0);
+        Almanac b; alm_init(&b, 9);
+        CHECK(alm_load_json(&b, doc, strlen(doc)) == ALM_LOAD_OK && b.events[0].days == 1 &&
+              alm_events_on(&b, s0 + 1, NULL, 0) == 0, "old file: one day");
+        alm_free(&b);
+    }
+    /* near the abs limits a span never overflows */
+    {
+        alm_event_save_span(&a, NULL, IWD_ABS_MAX - 2, "Edge", ALM_EV_NATURAL, IWD_REPEAT_NONE, "", 30, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), IWD_ABS_MAX, 0, NULL) == 2, "edge max");
+        AlmMark mk[4];
+        int n = alm_marks_on(&a, IWD_ABS_MAX, mk, 4), j = n > 0 && mk[0].builtin ? 1 : 0;
+        if (n > j) alm_fmt_mark_meta(&mk[j], IWD_ABS_MAX, buf, sizeof buf);
+        alm_event_save_span(&a, NULL, IWD_ABS_MIN, "Edge2", ALM_EV_NATURAL, IWD_REPEAT_YEARLY, "", 30, NOW, &upd);
+        CHECK(alm_event_span_day(last_ev(&a), IWD_ABS_MIN + 29, 0, NULL) == 29, "edge min");
+    }
+    alm_free(&a);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) { fprintf(stderr, "usage: test_store CASES_FILE TMPDIR\n"); return 2; }
@@ -828,6 +1150,7 @@ int main(int argc, char **argv)
     test_round_trip(argv[2]);
     test_actions();
     test_minutes(argv[2]);
+    test_spans();
     test_malformed();
     test_fuzz(argv[1]);
     if (g_fail) { fprintf(stderr, "store tests: %d of %d checks FAILED\n", g_fail, g_checks); return 1; }

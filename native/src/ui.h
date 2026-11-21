@@ -70,7 +70,7 @@ void surf_free(Surface *s);
 /* ------------------------------------------------------------------ hit regions */
 enum {
     H_NONE = 0,
-    H_UNIT_F, H_UNIT_C, H_SOUND, H_SETTINGS,
+    H_UNIT_F, H_UNIT_C, H_SOUND, H_INTERIOR, H_SETTINGS,
     H_ADVANCE, H_STEP,                /* H_STEP arg = minutes: -60 -30 -5 5 30 60 */
     H_DAY_PREV, H_DAY_NEXT, H_TIMELINE, H_TIP,
     H_CAL_PREV, H_CAL_NEXT, H_CAL_TODAY, H_CAL_CELL, H_UPCOMING,
@@ -78,6 +78,7 @@ enum {
     H_FORM_CANCEL, H_FORM_SAVE, H_NOTES, H_TOAST, H_SCROLL,
     H_HEAD_NOW, H_BACK_TODAY, H_KEYS, H_KEYS_CARD, H_SAVE_FAIL, H_INTRO_SETTINGS,
     H_LEDGER,                         /* footer dice chip: dice ledger open / closed */
+    H_FORM_DAYS,                      /* event form "Lasts" stepper: arg -1 shorter, +1 longer */
     /* settings dialog */
     H_S_MONTH, H_S_RANDOM, H_S_EXPORT, H_S_IMPORT, H_S_CANCEL, H_S_APPLY, H_S_CLOSE
 };
@@ -141,9 +142,13 @@ typedef struct Ui {
     char      form_id[64];        /* "" = new event */
     int       form_type;          /* AlmEvType */
     int       form_repeat;        /* IwdRepeat */
+    int       form_days;          /* "Lasts" 1..ALM_EVENT_DAYS_MAX */
     bool      form_invalid;
     HWND      ed_title, ed_details;
     RECT      rc_title, rc_details;   /* content coords (unscrolled) */
+    HWND      ed_days;            /* "Lasts [n] days" number field */
+    RECT      rc_days;
+    bool      form_days_invalid;
 
     /* notes */
     HWND      ed_notes;
@@ -287,6 +292,7 @@ int  ui_popup_choice(HWND owner, int x, int y, int w, const char *const *labels,
 LRESULT ui_menu_measure(MEASUREITEMSTRUCT *mi);
 LRESULT ui_menu_draw(DRAWITEMSTRUCT *di);
 void ui_sound_toggle(void);
+void ui_interior_toggle(void);
 void ui_open_form(const AlmEvent *ev);
 void ui_close_form(void);
 void ui_form_submit(void);

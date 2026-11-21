@@ -36,7 +36,7 @@ The behaviour is specified in [SPEC.md](SPEC.md).
 | `src/ui_view_cal.c` | Calendar, upcoming, day panel with the event form and notes |
 | `src/ui_settings.c` | Settings dialog, including backup export and import |
 | `src/main.c` | Window, message loop, input, EDIT controls, popup menu, timers, persistence, sound, test hooks |
-| `test/` | Host tests: C engine parity with the JS engine in node, store round trips, audio (`test/run.sh`) |
+| `test/` | Host tests: C engine parity with the JS engine in node, store round trips, audio synthesis and dropout stress (`test/run.sh`); `AUDIO_DEVICE_TEST=1` also runs the waveOut layer against a fake real-time device under wine |
 
 ## Build
 
@@ -64,7 +64,7 @@ then swapped in. The file is:
 
 If the file is corrupt, it is renamed to `<file>.bad` and a fresh almanac is started.
 The JSON is the same one the web app keeps in localStorage, plus a `"native"` key that
-holds the window position, the sound setting and whether the dice ledger is open. The
+holds the window position, the sound and Interior settings and whether the dice ledger is open. The
 clock is stored as minutes / 60 (a plain number the web app accepts). **Settings → Export backup** writes a
 backup file that the web app can import, and the native app can import the web app's
 backups.
@@ -84,14 +84,16 @@ see its key; F1 (or the "?" chip) shows them all.
 | Ctrl+Right / Ctrl+Left, "+5m" / "−5m" | forward / back 5 minutes |
 | (past midnight) | forward on today advances the party to the next day (Ctrl+Z steps back); back past 00:00 views the previous day, today stays. A held key never crosses midnight |
 | N, "Advance to …" | Advance Day (lands at 12:00) |
-| Ctrl+Z | step back (the last advance, midnight step or make-today, with its clock) |
+| Ctrl+Z | undo the last day step (advance, midnight step or make-today, with its clock) or, if it came later, the last event deletion |
 | PageUp / PageDown, "‹ Previous day" / "Next day ›" | view the previous / next day |
 | T, Esc, "Back to today" (hero), "Today" (calendar) | back to the party's day and clock |
 | Click / drag the timeline | scrub the time (5-minute steps) |
 | Click a calendar day | view it |
 | Double-click a calendar day, "Make this day today" | make it the current day |
 | E / O, "Add" | new event or reminder / write a note for the viewed day |
+| (event form) "Lasts", − / +, Up / Down in the field | how many days the event lasts (1 to 30); every day of a span links to the same event and note |
 | M, Sound | wind sound on / off ("No audio" if no device) |
+| I, Interior | while the sound is on: muffle it as heard from inside a building (sound only; remembered) |
 | °F / °C (header) | switch the temperature unit |
 | F2, Settings | Settings (start date, seed, year names, moon, backup) |
 | F1, "?" | keyboard shortcuts card |
@@ -102,8 +104,9 @@ see its key; F1 (or the "?" chip) shows them all.
 In text fields:
 
 - Esc leaves the field. It cancels the event form, or saves the notes.
-- Enter in Title submits the form, and so does Ctrl+Enter in Details.
-- Tab moves between Title and Details.
+- Enter in Title or Lasts submits the form, and so does Ctrl+Enter in Details.
+- Tab moves Title → Lasts → Details (Shift+Tab back).
+- Up / Down in Lasts make the event one day longer / shorter.
 - Ctrl+A selects all.
 
 ## Test hooks

@@ -25,6 +25,7 @@
  *   H_NONE, H_TIP          ignored (cover / tooltip only)
  *   H_UNIT_F / H_UNIT_C 0  alm_set_unit
  *   H_SOUND           0    ui_sound_toggle
+ *   H_INTERIOR        0    ui_interior_toggle (only while the sound is on)
  *   H_SETTINGS, H_INTRO_SETTINGS 0  Settings
  *   H_ADVANCE         0    alm_advance(12)
  *   H_STEP            d    alm_step_minutes(d), d = -60 -30 -5 5 30 60
@@ -42,6 +43,8 @@
  *   H_ADD_EVENT       0    ui_open_form(NULL)
  *   H_FORM_TYPE       t    g.form_type = t (AlmEvType)
  *   H_FORM_REPEAT     0    ui_popup_choice under the hit rect -> g.form_repeat
+ *   H_FORM_DAYS      -1/+1 "Lasts" stepper: one day shorter / longer (1..ALM_EVENT_DAYS_MAX);
+ *                          the number field g.ed_days takes typed digits, Up / Down step
  *   H_FORM_CANCEL / H_FORM_SAVE 0   ui_close_form / ui_form_submit
  *   H_NOTES           0    ui_notes_begin
  *   H_LEDGER          0    open / close the dice ledger (native.ledger, persisted)
@@ -60,11 +63,12 @@
  *                       Auto-repeat steps the clock but never crosses midnight.
  *   N                   Advance Day (lands at 12:00); Enter never advances (too easy to
  *                       hit twice). Every advance / make-today toasts "Ctrl+Z steps back".
- *   Ctrl+Z              one-level undo of the last advance / make-today / midnight step
+ *   Ctrl+Z              one-level undo of the last advance / make-today / midnight step,
+ *                       or of an event deletion when that came later ("restored")
  *   PageUp / PageDown   previous / next day
  *   T, Esc              back to today (Esc first closes the event form, else the toast)
  *   E / O               new event / write a note for the viewed day (scroll restored after)
- *   M                   wind sound
+ *   M                   wind sound        I    interior (muffled), while the sound is on
  *   F2                  Settings         F1   keyboard shortcuts card (any key closes it)
  *   Up / Down           scroll the page; Ctrl+Home / Ctrl+End top / bottom
  * Time-changing keys scroll the page back to the weather. While another day is viewed the
@@ -93,7 +97,7 @@ Ui g;
 /* ================================================================== private state */
 
 enum { T_TOAST = 1, T_NOTE, T_ARM, T_SAVE, T_THUNDER, T_FADE };
-enum { ID_ED_TITLE = 201, ID_ED_DETAILS, ID_ED_NOTES };
+enum { ID_ED_TITLE = 201, ID_ED_DETAILS, ID_ED_NOTES, ID_ED_DAYS };
 #define WM_APP_DROP_NOTES (WM_APP + 1)
 #define WM_APP_HOOKS      (WM_APP + 2)
 
@@ -115,6 +119,15 @@ static int      s_boot_notice;                   /* 1 corrupt (renamed), 2 unrea
 
 /* one-level undo of a move of "today" (not persisted, no timer) */
 static struct { bool ok; int32_t cur_abs; double time; } s_undo;
+/* one-level undo of an event deletion (a deep copy; the most recent undoable action while
+ * ok: a later move of today forgets it) */
+static struct { bool ok; AlmEvent ev; int idx; } s_undo_del;
+
+static void undo_del_forget(void)
+{
+    if (s_undo_del.ok) alm_event_release(&s_undo_del.ev);
+    s_undo_del.ok = false;
+}
 
 /* test hooks */
 static WCHAR   *s_opt_state;
@@ -133,7 +146,7 @@ static uint32_t rnd32(void)
 static bool any_edit_focused(void)
 {
     HWND f = GetFocus();
-    return f && (f == g.ed_title || f == g.ed_details || f == g.ed_notes);
+    return f && (f == g.ed_title || f == g.ed_details || f == g.ed_notes || f == g.ed_days);
 }
 
 /* ================================================================== redraw */
@@ -378,6 +391,17 @@ void ui_sound_toggle(void)
     ui_redraw();
 }
 
+/* Interior: the sound as heard from inside a building. Sound only; changeable only while
+ * the sound is on (the chip is dimmed otherwise), remembered in the native prefs. */
+void ui_interior_toggle(void)
+{
+    if (g.sound_missing || !audio_is_enabled()) return;
+    g.a.native.interior = !g.a.native.interior;
+    audio_set_interior(g.a.native.interior);
+    ui_save_now();
+    ui_redraw();
+}
+
 /* ================================================================== EDIT controls */
 
 static HMODULE s_uxtheme;
@@ -450,6 +474,37 @@ static void notes_leave(void)
     if (g.saved_scroll >= 0) { view_scroll_to(g.saved_scroll); g.saved_scroll = -1; }
 }
 
+/* "Lasts" field: current value (0 when empty / not a number) */
+static int form_days_read(void)
+{
+    WCHAR b[16];
+    int v = 0, i;
+    if (!g.ed_days) return g.form_days;
+    GetWindowTextW(g.ed_days, b, 16);
+    for (i = 0; b[i]; i++) {
+        if (b[i] < L'0' || b[i] > L'9') return 0;
+        v = v * 10 + (b[i] - L'0');
+        if (v > 1000) return 1000;
+    }
+    return v;
+}
+
+static void form_days_step(int d)
+{
+    int v = form_days_read();
+    WCHAR b[16];
+    bool was = g.form_days_invalid;
+    v = clampi((v < 1 ? (d > 0 ? 0 : 2) : v) + d, 1, ALM_EVENT_DAYS_MAX);
+    g.form_days = v;
+    g.form_days_invalid = false;
+    if (g.ed_days) {
+        wsprintfW(b, L"%d", v);
+        SetWindowTextW(g.ed_days, b);
+        SendMessageW(g.ed_days, EM_SETSEL, 0, -1);
+    }
+    if (was) ui_relayout(); else ui_redraw();     /* the error line comes and goes */
+}
+
 static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     WNDPROC old = (WNDPROC)GetPropW(h, L"iwd.proc");
@@ -476,12 +531,27 @@ static LRESULT CALLBACK edit_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (wp == VK_TAB) {
             if (h == g.ed_notes) notes_leave();
-            else if (h == g.ed_title && g.ed_details) SetFocus(g.ed_details);
-            else if (h == g.ed_details && g.ed_title) SetFocus(g.ed_title);
+            else if (h == g.ed_title && (g.ed_days || g.ed_details)) {
+                HWND nx = shift ? g.ed_details : g.ed_days ? g.ed_days : g.ed_details;
+                if (nx) { SetFocus(nx); if (nx == g.ed_days) SendMessageW(nx, EM_SETSEL, 0, -1); }
+            }
+            else if (h == g.ed_days) {
+                HWND nx = shift ? g.ed_title : g.ed_details;
+                if (nx) SetFocus(nx);
+            }
+            else if (h == g.ed_details && g.ed_title) {
+                HWND nx = shift && g.ed_days ? g.ed_days : g.ed_title;
+                SetFocus(nx);
+                if (nx == g.ed_days) SendMessageW(nx, EM_SETSEL, 0, -1);
+            }
             (void)shift;
             return 0;
         }
-        if (wp == VK_RETURN && ((h == g.ed_title) || (h == g.ed_details && ctrl))) {
+        if (h == g.ed_days && (wp == VK_UP || wp == VK_DOWN)) {
+            form_days_step(wp == VK_UP ? 1 : -1);
+            return 0;
+        }
+        if (wp == VK_RETURN && ((h == g.ed_title) || h == g.ed_days || (h == g.ed_details && ctrl))) {
             ui_form_submit();
             return 0;
         }
@@ -540,7 +610,7 @@ static void edit_vsb(HWND ed)
 /* --- placement of the main window's EDITs from the content rects (after each paint) */
 
 typedef struct EdPlace { HWND ed; RECT r; int clip0, clip1; bool shown; } EdPlace;
-static EdPlace s_place[3];
+static EdPlace s_place[4];
 
 static void edit_place(int slot, HWND ed, const RECT *rc)
 {
@@ -594,6 +664,7 @@ static void edits_sync(void)
     edit_place(0, g.ed_title, &g.rc_title);
     edit_place(1, g.ed_details, &g.rc_details);
     edit_place(2, g.ed_notes, &g.rc_notes);
+    edit_place(3, g.ed_days, &g.rc_days);
 }
 
 /* ================================================================== event form */
@@ -608,15 +679,25 @@ void ui_open_form(const AlmEvent *ev)
         lstrcpynA(g.form_id, ev->id ? ev->id : "", (int)sizeof g.form_id);
         g.form_type = ev->type;
         g.form_repeat = ev->repeat;
+        g.form_days = clampi(ev->days, 1, ALM_EVENT_DAYS_MAX);
     } else {
         g.form_id[0] = 0;
         g.form_type = s_last_type;             /* last used type (first: Reminder) */
         g.form_repeat = IWD_REPEAT_NONE;
+        g.form_days = 1;
     }
+    g.form_days_invalid = false;
     g.ed_title = ui_make_edit(g.hwnd, ID_ED_TITLE, false, ALM_TITLE_MAX_UNITS, F_BODY, ev ? ev->title : "");
     g.ed_details = ui_make_edit(g.hwnd, ID_ED_DETAILS, true, ALM_DETAILS_MAX_UNITS, F_BODY, ev ? ev->details : "");
+    {
+        char db[8];
+        snprintf(db, sizeof db, "%d", g.form_days);
+        g.ed_days = ui_make_edit(g.hwnd, ID_ED_DAYS, false, 2, F_BODY, db);
+        if (g.ed_days) SetWindowLongPtrW(g.ed_days, GWL_STYLE, GetWindowLongPtrW(g.ed_days, GWL_STYLE) | ES_NUMBER);
+    }
     SetRectEmpty(&g.rc_title);
     SetRectEmpty(&g.rc_details);
+    SetRectEmpty(&g.rc_days);
     if (g.ed_title) { SetFocus(g.ed_title); SendMessageW(g.ed_title, EM_SETSEL, 0, -1); }
     s_form_scroll = true;
     ui_relayout();
@@ -625,15 +706,18 @@ void ui_open_form(const AlmEvent *ev)
 void ui_close_form(void)
 {
     bool had_focus = any_edit_focused() && GetFocus() != g.ed_notes;
-    if (!g.form_open && !g.ed_title && !g.ed_details) return;
+    if (!g.form_open && !g.ed_title && !g.ed_details && !g.ed_days) return;
     g.form_open = false;
     g.form_id[0] = 0;
     g.form_invalid = false;
     if (had_focus) SetFocus(g.hwnd);
     if (g.ed_title) { DestroyWindow(g.ed_title); g.ed_title = NULL; }
     if (g.ed_details) { DestroyWindow(g.ed_details); g.ed_details = NULL; }
+    if (g.ed_days) { DestroyWindow(g.ed_days); g.ed_days = NULL; }
+    g.form_days_invalid = false;
     SetRectEmpty(&g.rc_title);
     SetRectEmpty(&g.rc_details);
+    SetRectEmpty(&g.rc_days);
     ui_relayout();
     if (g.saved_scroll >= 0) {               /* opened by a shortcut: back to where the DM was */
         view_layout();
@@ -660,7 +744,16 @@ void ui_form_submit(void)
     char *title, *details;
     bool upd = false;
     AlmResult r;
+    int days;
     if (!g.form_open) return;
+    days = form_days_read();
+    if (days < 1 || days > ALM_EVENT_DAYS_MAX) {   /* "Lasts": 1..30 whole days */
+        g.form_days_invalid = true;
+        if (g.ed_days) { SetFocus(g.ed_days); SendMessageW(g.ed_days, EM_SETSEL, 0, -1); }
+        ui_relayout();
+        return;
+    }
+    g.form_days = days;
     title = ui_edit_text(g.ed_title);
     details = ui_edit_text(g.ed_details);
     if (!title || blank_w(title)) {
@@ -670,10 +763,10 @@ void ui_form_submit(void)
         ui_redraw();
         return;
     }
-    r = alm_event_save(&g.a, g.form_id[0] ? g.form_id : NULL, g.a.sel_abs, title,
-                       (AlmEvType)clampi(g.form_type, 0, ALM_EV_TYPE_COUNT - 1),
-                       (IwdRepeat)clampi(g.form_repeat, 0, IWD_REPEAT_COUNT - 1),
-                       details ? details : "", ui_now_ms(), &upd);
+    r = alm_event_save_span(&g.a, g.form_id[0] ? g.form_id : NULL, g.a.sel_abs, title,
+                            (AlmEvType)clampi(g.form_type, 0, ALM_EV_TYPE_COUNT - 1),
+                            (IwdRepeat)clampi(g.form_repeat, 0, IWD_REPEAT_COUNT - 1),
+                            details ? details : "", days, ui_now_ms(), &upd);
     free(title); free(details);
     if (r.fx & ALM_FX_REJECTED) {
         if (!(r.fx & ALM_FX_TOAST)) { g.form_invalid = true; if (g.ed_title) SetFocus(g.ed_title); }
@@ -820,6 +913,7 @@ void ui_after_settings(bool changed)
 {
     g.rev++;
     if (changed) {
+        undo_del_forget();                           /* import / reset: another almanac */
         if (g.form_open && g.form_id[0] && !alm_event_find(&g.a, g.form_id)) ui_close_form();
         if (g.armed_id[0] && !alm_event_find(&g.a, g.armed_id)) g.armed_id[0] = 0;
         if (g.ed_notes) notes_drop();
@@ -927,6 +1021,7 @@ static void post_apply(const Pre *p, AlmResult r)
         g.party_time = -1;
         if (p->cur0 >= 0) {
             s_undo.ok = true; s_undo.cur_abs = p->cur_abs0; s_undo.time = p->party0;
+            undo_del_forget();                       /* the day step is now the latest */
         }
         today_moved_toast(p, &r);
         ui_apply(r);
@@ -1011,6 +1106,13 @@ static void do_undo(void)
     AlmResult r, t;
     char d[IWD_DATE_CAP], msg[ALM_TOAST_CAP];
     int m;
+    if (s_undo_del.ok) {                                 /* the latest action was a deletion */
+        r = alm_event_restore(&g.a, &s_undo_del.ev, s_undo_del.idx);
+        undo_del_forget();
+        if (r.fx & ALM_FX_REJECTED) { ui_toast("The deleted event cannot be restored"); return; }
+        ui_apply_durable(r);
+        return;
+    }
     if (!s_undo.ok) { ui_toast("Nothing to step back to"); return; }
     s_undo.ok = false;
     ui_notes_flush();
@@ -1052,8 +1154,21 @@ static void ev_action(int id, int arg)
         lstrcpynA(idc, ev->id, (int)sizeof idc);
         g.armed_id[0] = 0;
         KillTimer(g.hwnd, T_ARM);
+        AlmEvent copy;
+        int idx = alm_event_index(&g.a, idc);
+        bool have = alm_event_dup(&copy, ev);
         if (g.form_open && strcmp(g.form_id, idc) == 0) ui_close_form();
         DURABLE(ACT(alm_event_delete(&g.a, idc)));
+        if (have && !alm_event_find(&g.a, idc)) {
+            undo_del_forget();
+            s_undo_del.ev = copy;
+            s_undo_del.idx = idx;
+            s_undo_del.ok = true;
+            if (g.toast_on && !g.toast_day)
+                lstrcpynA(g.toast_hint, "Ctrl+Z restores it", (int)sizeof g.toast_hint);
+        } else if (have) {
+            alm_event_release(&copy);
+        }
     } else {
         lstrcpynA(g.armed_id, ev->id ? ev->id : "", (int)sizeof g.armed_id);
         SetTimer(g.hwnd, T_ARM, ALM_DELETE_ARM_MS, NULL);
@@ -1099,6 +1214,7 @@ static void dispatch(int id, int arg, const RECT *hr)
     case H_UNIT_F:        DURABLE(ACT(alm_set_unit(&g.a, false))); break;
     case H_UNIT_C:        DURABLE(ACT(alm_set_unit(&g.a, true))); break;
     case H_SOUND:         ui_sound_toggle(); break;
+    case H_INTERIOR:      ui_interior_toggle(); break;
     case H_SETTINGS:
     case H_INTRO_SETTINGS: ui_open_settings(); break;
     case H_ADVANCE:       do_advance(); to_weather(); break;
@@ -1150,6 +1266,7 @@ static void dispatch(int id, int arg, const RECT *hr)
         if (arg >= 0 && arg < ALM_EV_TYPE_COUNT) { g.form_type = arg; ui_redraw(); }
         break;
     case H_FORM_REPEAT:   if (hr) form_repeat_popup(hr); break;
+    case H_FORM_DAYS:     form_days_step(arg < 0 ? -1 : 1); break;
     case H_FORM_CANCEL:   ui_close_form(); break;
     case H_FORM_SAVE:     ui_form_submit(); break;
     case H_NOTES:         ui_notes_begin(); break;
@@ -1284,6 +1401,7 @@ static void on_key(WPARAM vk, LPARAM lp)
     case VK_DOWN:  view_scroll_to(g.scroll + line_px()); break;
     case 'T':      do_today(); to_weather(); break;
     case 'M':      ui_sound_toggle(); break;
+    case 'I':      ui_interior_toggle(); break;
     case 'E':      if (g.a.sel_abs != INT32_MIN) open_form_shortcut(); break;
     case 'O':      notes_shortcut(); break;
     case VK_ESCAPE:
@@ -1382,6 +1500,7 @@ static void restyle_all(void)
 {
     if (g.ed_title) ui_style_edit(g.ed_title, F_BODY);
     if (g.ed_details) ui_style_edit(g.ed_details, F_BODY);
+    if (g.ed_days) ui_style_edit(g.ed_days, F_BODY);
     if (g.ed_notes) ui_style_edit(g.ed_notes, F_BODY);
     if (g.tip_hwnd) SendMessageW(g.tip_hwnd, TTM_SETMAXTIPWIDTH, 0, dp(380));
 }
@@ -1639,6 +1758,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         } else if (c && c == g.ed_title) {
             if (code == EN_CHANGE && g.form_invalid) { g.form_invalid = false; ui_redraw(); }
             else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) ui_redraw();
+        } else if (c && c == g.ed_days) {
+            if (code == EN_CHANGE) {          /* "day" / "days" follows the typed number */
+                int v = form_days_read();
+                bool was = g.form_days_invalid;
+                if (v >= 1 && v <= ALM_EVENT_DAYS_MAX) g.form_days = v;
+                g.form_days_invalid = false;
+                if (was) ui_relayout(); else ui_redraw();
+            } else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) ui_redraw();
         } else if (c && c == g.ed_details) {
             if (code == EN_SETFOCUS || code == EN_KILLFOCUS) ui_redraw();
             else if (code == EN_CHANGE) edit_vsb(c);
@@ -1898,6 +2025,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmdline, int show)
         ShowWindow(hwnd, show);
     }
 
+    audio_set_interior(g.a.native.interior);
     if (g.a.native.sound) {
         if (!audio_set_enabled(true)) { g.sound_missing = true; g.a.native.sound = false; }
     }

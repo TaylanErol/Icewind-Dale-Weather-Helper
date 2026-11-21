@@ -41,7 +41,7 @@
  *    "yearNames": {"1489": "Year of the Warrior Princess"},
  *    "notes": {"543869": "free text"},
  *    "events": [{"id": "e...", "abs": 543869, "title": "...", "type": "natural",
- *                "repeat": "none", "details": ""}],
+ *                "repeat": "none", "details": ""}],      (+ "days": n when n > 1, last)
  *    "ui": {"chainNoteHidden": false, "calYear": 1489, "calMonth": 0}
  *  }
  *  The web writes it with JSON.stringify(snapshot()) (compact). A backup file is
@@ -53,8 +53,9 @@
  *  for the same state (numbers formatted as ECMAScript Number.prototype.toString).
  *
  *  Native save file: the same compact v2 object followed by one extra key "native"
- *  (window placement, sound, dice ledger open) that the web app ignores. "native" is never
- *  exported. Native key order: "sound", "maximized", "ledger", then "x" "y" "w" "h" when the
+ *  (window placement, sound, interior, dice ledger open) that the web app ignores. "native"
+ *  is never exported. Native key order: "sound", "interior", "maximized", "ledger", then
+ *  "x" "y" "w" "h" when the
  *  window rect is known; an old "tab" key is ignored.
  *
  *  v1 migration (web: localStorage "iwd-weather-v1", used only when no v2 save exists):
@@ -92,6 +93,9 @@
  *       type    one of natural|unnatural|auril|reminder, else "natural"
  *       repeat  one of none|newmoon|fullmoon|tenday|monthly|yearly, else "none"
  *       details string ? first 2000 UTF-16 code units (NOT trimmed here) : ""
+ *       days    NATIVE ONLY (the web's cleanEvent drops the key): isInt ? clamp(days, 1,
+ *               ALM_EVENT_DAYS_MAX) : 1. Written after "details", and only when > 1, so a
+ *               file whose events all last one day is byte-identical to the web's.
  *  ui          chainNoteHidden = !!ui.chainNoteHidden;
  *              calYear  = isInt ? ui.calYear : monthOf(selAbs).year
  *              calMonth = isInt && 0..11 ? ui.calMonth : monthOf(selAbs).month
@@ -131,6 +135,7 @@ extern "C" {
 #define ALM_MOON_OFFSET_MIN    (-30.0)
 #define ALM_MOON_OFFSET_MAX    30.0
 #define ALM_MAX_EVENTS         20000   /* native safety cap (web: unlimited) */
+#define ALM_EVENT_DAYS_MAX     30      /* longest event span in days (one Harptos month) */
 #define ALM_MAX_NOTE_BYTES     (256 * 1024)
 #define ALM_MAX_FILE_BYTES     (32 * 1024 * 1024)
 #define ALM_UPCOMING_DAYS      10      /* upcoming list covers base .. base + 10 (11 days) */
@@ -196,7 +201,18 @@ typedef struct AlmEvent {
     AlmEvType type;
     IwdRepeat repeat;
     char     *details;     /* trimmed by the form, <= 2000 UTF-16 units, may be "" */
+    int       days;        /* span: each occurrence lasts 1..ALM_EVENT_DAYS_MAX days */
 } AlmEvent;
+
+/* Multi-day spans (native). An occurrence that starts on day S (any day iwd_occurs_on
+ * accepts for the event's anchor and repeat) covers S .. S + days - 1, whatever lies in
+ * between (month ends, festival days, Shieldmeet, the year's end). When occurrences overlap
+ * (a span longer than its repeat interval, e.g. 15 days every tenday) a day belongs to the
+ * LATEST occurrence covering it: the event shows once on that day and its day count
+ * restarts at each new occurrence.
+ * Returns the 0-based day of the span on abs, or -1 when the event is not on abs;
+ * *occ_start (may be NULL) receives the occurrence's first day. */
+int alm_event_span_day(const AlmEvent *e, int32_t abs, double moon_offset, int32_t *occ_start);
 
 /* One mark shown on a day: a user event, or the built-in new-moon sacrifice
  * (calendar.js NEW_MOON: type auril, title "New moon — sacrifice to Auril",
@@ -207,6 +223,9 @@ typedef struct AlmMark {
     AlmEvType       type;
     const char     *title;   /* full title (tooltip) */
     const char     *chip;    /* chip text: builtin "Sacrifice to Auril", else the title */
+    int             span_day;   /* 0-based day of the event's span on this day (0 builtin) */
+    int             span_len;   /* event->days (1 builtin) */
+    int32_t         span_start; /* first day of the occurrence shown on this day */
 } AlmMark;
 
 #define ALM_NEW_MOON_TITLE "New moon — sacrifice to Auril"
@@ -227,6 +246,7 @@ typedef struct AlmUi {
 /* Native-only preferences, saved under "native" in the save file, never exported. */
 typedef struct AlmNative {
     bool    sound;               /* wind ambience on (web: always starts off) */
+    bool    interior;            /* sound muffled as heard indoors (sound only) */
     bool    has_rect;            /* window rect below is valid */
     int32_t win_x, win_y, win_w, win_h;   /* restored (non-maximised) window rect, px */
     bool    maximized;
@@ -576,15 +596,33 @@ size_t alm_normalize_seed(const char *in, char *buf, size_t cap);
  * base36(now_ms) + base36(floor(rand * 1e6)) anchored on abs. An update keeps the stored
  * event's id and anchor abs (the web never moves an event); abs is then ignored.
  * At ALM_MAX_EVENTS a new event is REJECTED with a toast. Sets *was_update.
- * Toast: "<b>TITLE</b> updated" / "<b>TITLE</b> added to the almanac". */
+ * Toast: "<b>TITLE</b> updated" / "<b>TITLE</b> added to the almanac".
+ * alm_event_save keeps an updated event's days (new events last 1 day). */
 AlmResult alm_event_save(Almanac *a, const char *id, int32_t abs, const char *title,
                          AlmEvType type, IwdRepeat repeat, const char *details,
                          double now_ms, bool *was_update);
-/* deleteEvent (all occurrences of a repeating event). Toast "<b>TITLE</b> removed". */
+/* The same with a span length: days 1..ALM_EVENT_DAYS_MAX (clamped); days <= 0 keeps an
+ * updated event's length (1 for a new event). The anchor never moves, so editing from any
+ * day of a span edits the one event and its days count from the anchor. */
+AlmResult alm_event_save_span(Almanac *a, const char *id, int32_t abs, const char *title,
+                              AlmEvType type, IwdRepeat repeat, const char *details, int days,
+                              double now_ms, bool *was_update);
+/* deleteEvent (all occurrences of a repeating event, every day of a span). Toast
+ * "<b>TITLE</b> removed", plus " · all N days" for a span. */
 AlmResult alm_event_delete(Almanac *a, const char *id);
 const AlmEvent *alm_event_find(const Almanac *a, const char *id);
+/* Native undo of a deletion. alm_event_dup deep-copies an event (false on out of memory;
+ * dst is then empty); alm_event_release frees such a copy. alm_event_index: the event's
+ * position in a->events, -1 if absent. alm_event_restore re-inserts a copy with its
+ * original id, anchor, type, repeat, details and days at position index (clamped; the
+ * array order decides ties in eventsOn); REJECTED when the id is already present, the
+ * anchor is invalid or the almanac is full. Toast "<b>TITLE</b> restored". */
+bool alm_event_dup(AlmEvent *dst, const AlmEvent *src);
+void alm_event_release(AlmEvent *e);
+int  alm_event_index(const Almanac *a, const char *id);
+AlmResult alm_event_restore(Almanac *a, const AlmEvent *ev, int index);
 
-/* eventsOn(abs): user events occurring on abs, sorted by type priority then anchor abs
+/* eventsOn(abs): user events occurring on abs (on any day of a span), sorted by type priority then anchor abs
  * (stable: ties keep array order). allOn(abs): the built-in new-moon mark first when the
  * moon is new that day, then eventsOn. Return the total count; write at most cap (out may be
  * NULL with cap 0 to count). AlmMark / AlmEvent pointers stay valid only until the event
@@ -594,8 +632,19 @@ int alm_marks_on(const Almanac *a, int32_t abs, AlmMark *out, int cap);
 
 /* Day panel event meta line: builtin ALM_NEW_MOON_META; else
  * "<Type label> · <"One-time" | repeat label>" + (repeat && abs != anchor ?
- * " · since <short date> <year>" : "")   e.g. "Auril · Every tenday · since 3 Hammer 1489" */
+ * " · since <short date> <year>" : "")   e.g. "Auril · Every tenday · since 3 Hammer 1489"
+ * A span adds " · Day <k> of <n> · <alm_fmt_span_range of this occurrence>", e.g.
+ * "Natural · Every year · since 3 Hammer 1489 · Day 2 of 5 · 3–7 Hammer". */
 size_t alm_fmt_mark_meta(const AlmMark *m, int32_t shown_abs, char *buf, size_t cap);
+/* The days start .. start + days - 1 (days clamped to 1..ALM_EVENT_DAYS_MAX) as short
+ * dates whose inner spaces are U+00A0 (a date never wraps inside itself):
+ *   1 day                 "5 Hammer"
+ *   within one month      "5–9 Hammer"
+ *   otherwise             "30 Hammer – 1 Alturiak", "30 Hammer – Midwinter" */
+size_t alm_fmt_span_range(int32_t start, int days, char *buf, size_t cap);
+/* Chip text of a mark: the chip text, then for a span " · day <k> of <n>" (in progress), or
+ * with starts true " · <n> days" (an Upcoming row where the span begins). */
+size_t alm_fmt_mark_chip(const AlmMark *m, bool starts, char *buf, size_t cap);
 
 /* setNote(abs, text): text with a non-blank trim() is stored verbatim (insertion order kept
  * for an existing key), otherwise the note is deleted. Native cap ALM_MAX_NOTE_BYTES. */
@@ -632,19 +681,25 @@ typedef struct AlmCell {
 int alm_month_cells(const Almanac *a, AlmCell out[32]);
 /* Accessible label: date · moon name · "sacrifice to Auril" · "<dominant>, low <temp>" ·
  * event titles · "has notes" · "current day" · "expedition start" (non-empty parts joined
- * by " · "; festival cells append ", festival"). */
+ * by " · "). A festival cell adds nothing more: its date already names the festival
+ * (the web's aria-label appends ", festival"). */
 size_t alm_fmt_cell_label(const Almanac *a, const AlmCell *c, char *buf, size_t cap);
 
 /* Upcoming: days base..base+10 with at least one mark, base = today or start_abs.
  * Each item: abs, rel = relDays(abs - base), short date. Note line:
  * "next ten days from today" (today set) / "from the expedition start". Empty list text:
- * "Nothing marked for the next ten days." */
+ * "Nothing marked for the next ten days."
+ * Native: a span is listed once, on the row where its occurrence starts (or on the first
+ * row, base, while it is already in progress there); n_marks counts the listed marks only
+ * and days whose only marks are continuing spans have no row. alm_upcoming_marks gives a
+ * row's listed marks (same rules, same order as alm_marks_on). */
 typedef struct AlmUpcoming {
     int32_t abs;
     int32_t rel_days;
     int     n_marks;
 } AlmUpcoming;
 int alm_upcoming(const Almanac *a, AlmUpcoming out[ALM_UPCOMING_DAYS + 1]);
+int alm_upcoming_marks(const Almanac *a, const AlmUpcoming *row, AlmMark *out, int cap);
 
 /* Day panel texts for sel_abs (calendar.js renderDetail):
  *  eyebrow: i < 0 "Before the expedition"; today "Today · Day N of the expedition";

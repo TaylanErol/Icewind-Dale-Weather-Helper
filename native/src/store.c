@@ -1235,6 +1235,12 @@ static bool clean_event(Almanac *c, const JVal *e, AlmEvent *out)
     }
     if (det && det->t == J_STR) out->details = xstrndup(det->str, u8_cut_units(det->str, det->slen, ALM_DETAILS_MAX_UNITS));
     else out->details = xstrdup("");
+    {   /* native span length: integers clamp to 1..max, anything else is one day */
+        const JVal *dv = jget(e, "days");
+        out->days = 1;
+        if (j_num(dv) && is_integral(dv->num))
+            out->days = dv->num < 1 ? 1 : dv->num > ALM_EVENT_DAYS_MAX ? ALM_EVENT_DAYS_MAX : (int)dv->num;
+    }
     if (!out->id || !out->title || !out->details) { event_free(out); return false; }
     return true;
 }
@@ -1244,6 +1250,7 @@ static void parse_native(const JVal *nv, AlmNative *n)
     if (!nv || nv->t != J_OBJ) return;
     const JVal *v;
     if ((v = jget(nv, "sound"))) n->sound = v->t == J_TRUE;
+    if ((v = jget(nv, "interior"))) n->interior = v->t == J_TRUE;
     if ((v = jget(nv, "maximized"))) n->maximized = v->t == J_TRUE;
     if ((v = jget(nv, "ledger"))) n->ledger = v->t == J_TRUE;
     int32_t x, y, w, h;
@@ -1399,6 +1406,7 @@ static void write_snapshot(const Almanac *a, JW *w, const char *exported_iso, bo
         jw_key(w, "type"); jw_str(w, alm_ev_type_key(e->type));
         jw_key(w, "repeat"); jw_str(w, iwd_repeat_key(e->repeat));
         jw_key(w, "details"); jw_str(w, e->details ? e->details : "");
+        if (e->days > 1) { jw_key(w, "days"); jw_int(w, e->days); }
         jw_end(w, '}');
     }
     jw_end(w, ']');
@@ -1413,6 +1421,7 @@ static void write_snapshot(const Almanac *a, JW *w, const char *exported_iso, bo
         jw_key(w, "native");
         jw_begin(w, '{');
         jw_key(w, "sound"); jw_bool(w, n->sound);
+        jw_key(w, "interior"); jw_bool(w, n->interior);
         jw_key(w, "maximized"); jw_bool(w, n->maximized);
         jw_key(w, "ledger"); jw_bool(w, n->ledger);
         if (n->has_rect) {
@@ -2216,6 +2225,13 @@ AlmResult alm_event_save(Almanac *a, const char *id, int32_t abs, const char *ti
                          AlmEvType type, IwdRepeat repeat, const char *details,
                          double now_ms, bool *was_update)
 {
+    return alm_event_save_span(a, id, abs, title, type, repeat, details, 0, now_ms, was_update);
+}
+
+AlmResult alm_event_save_span(Almanac *a, const char *id, int32_t abs, const char *title,
+                              AlmEvType type, IwdRepeat repeat, const char *details, int days,
+                              double now_ms, bool *was_update)
+{
     if (was_update) *was_update = false;
     if (!title) return rejected();
     int idx = -1;
@@ -2231,6 +2247,8 @@ AlmResult alm_event_save(Almanac *a, const char *id, int32_t abs, const char *ti
     e.details = dup_trim_cut(details ? details : "", ALM_DETAILS_MAX_UNITS);
     e.type = (unsigned)type < ALM_EV_TYPE_COUNT ? type : ALM_EV_NATURAL;
     e.repeat = (unsigned)repeat < IWD_REPEAT_COUNT ? repeat : IWD_REPEAT_NONE;
+    e.days = days > ALM_EVENT_DAYS_MAX ? ALM_EVENT_DAYS_MAX : days >= 1 ? days
+           : idx >= 0 && a->events[idx].days >= 1 ? a->events[idx].days : 1;
     if (idx >= 0) {
         e.id = xstrdup(a->events[idx].id);
         e.abs = a->events[idx].abs;          /* edits keep their anchor (web) */
@@ -2287,10 +2305,10 @@ AlmResult alm_event_delete(Almanac *a, const char *id)
     id = key;
     AlmResult r = res0();
     char *title = NULL;
-    int w = 0;
+    int w = 0, span = 1;
     for (int i = 0; i < a->n_events; i++) {
         if (strcmp(a->events[i].id, id) == 0) {
-            if (!title) { title = a->events[i].title; a->events[i].title = NULL; }
+            if (!title) { title = a->events[i].title; a->events[i].title = NULL; span = a->events[i].days; }
             event_free(&a->events[i]);
         } else {
             a->events[w++] = a->events[i];
@@ -2298,9 +2316,86 @@ AlmResult alm_event_delete(Almanac *a, const char *id)
     }
     a->n_events = w;
     r.fx = ALM_FX_RENDER_CAL | ALM_FX_RENDER_DAY | ALM_FX_SAVE;
-    if (title) { res_toast(&r, "", title, " removed"); free(title); }
+    if (title) {
+        char tail[48];
+        if (span > 1) snprintf(tail, sizeof tail, " removed \xC2\xB7 all %d days", span);
+        else snprintf(tail, sizeof tail, " removed");
+        res_toast(&r, "", title, tail);
+        free(title);
+    }
     free(key);
     return r;
+}
+
+bool alm_event_dup(AlmEvent *dst, const AlmEvent *src)
+{
+    memset(dst, 0, sizeof *dst);
+    if (!src || !src->id || !src->title) return false;
+    dst->id = xstrdup(src->id);
+    dst->title = xstrdup(src->title);
+    dst->details = xstrdup(src->details ? src->details : "");
+    dst->abs = src->abs;
+    dst->type = src->type;
+    dst->repeat = src->repeat;
+    dst->days = src->days;
+    if (!dst->id || !dst->title || !dst->details) { event_free(dst); return false; }
+    return true;
+}
+
+void alm_event_release(AlmEvent *e)
+{
+    if (e) event_free(e);
+}
+
+int alm_event_index(const Almanac *a, const char *id)
+{
+    if (!id) return -1;
+    for (int i = 0; i < a->n_events; i++)
+        if (strcmp(a->events[i].id, id) == 0) return i;
+    return -1;
+}
+
+AlmResult alm_event_restore(Almanac *a, const AlmEvent *ev, int index)
+{
+    if (!ev || !ev->id || !ev->id[0] || !ev->title || !ev->title[0] || !valid_abs(ev->abs) ||
+        alm_event_find(a, ev->id) || a->n_events >= ALM_MAX_EVENTS)
+        return rejected();
+    AlmEvent e;
+    if (!alm_event_dup(&e, ev)) return rejected();
+    e.type = (unsigned)e.type < ALM_EV_TYPE_COUNT ? e.type : ALM_EV_NATURAL;
+    e.repeat = (unsigned)e.repeat < IWD_REPEAT_COUNT ? e.repeat : IWD_REPEAT_NONE;
+    e.days = e.days < 1 ? 1 : e.days > ALM_EVENT_DAYS_MAX ? ALM_EVENT_DAYS_MAX : e.days;
+    if (a->n_events == a->cap_events) {
+        int nc = a->cap_events ? a->cap_events * 2 : 16;
+        AlmEvent *ne = (AlmEvent *)realloc(a->events, (size_t)nc * sizeof *ne);
+        if (!ne) { event_free(&e); return rejected(); }
+        a->events = ne;
+        a->cap_events = nc;
+    }
+    if (index < 0 || index > a->n_events) index = a->n_events;
+    memmove(&a->events[index + 1], &a->events[index], (size_t)(a->n_events - index) * sizeof e);
+    a->events[index] = e;
+    a->n_events++;
+    AlmResult r = res0();
+    res_toast(&r, "", e.title, " restored");
+    r.fx |= ALM_FX_RENDER_CAL | ALM_FX_RENDER_DAY | ALM_FX_SAVE;
+    return r;
+}
+
+int alm_event_span_day(const AlmEvent *e, int32_t abs, double moon_offset, int32_t *occ_start)
+{
+    if (!e) return -1;
+    int days = e->days < 1 ? 1 : e->days > ALM_EVENT_DAYS_MAX ? ALM_EVENT_DAYS_MAX : e->days;
+    if ((int64_t)abs - e->abs >= (int64_t)days && e->repeat == IWD_REPEAT_NONE) return -1;   /* fast path */
+    for (int k = 0; k < days; k++) {
+        int64_t s = (int64_t)abs - k;
+        if (s < e->abs) break;                               /* never before the anchor */
+        if (iwd_occurs_on(e->abs, e->repeat, (int32_t)s, moon_offset)) {
+            if (occ_start) *occ_start = (int32_t)s;
+            return k;
+        }
+    }
+    return -1;
 }
 
 typedef struct EvRef { const AlmEvent *e; int prio; int32_t abs; int idx; } EvRef;
@@ -2319,7 +2414,8 @@ int alm_events_on(const Almanac *a, int32_t abs, const AlmEvent **out, int cap)
     int n = 0, cap_refs = 64;
     for (int i = 0; i < a->n_events; i++) {
         const AlmEvent *e = &a->events[i];
-        if (!iwd_occurs_on(e->abs, e->repeat, abs, a->moon_offset)) continue;
+        if (e->days > 1 ? alm_event_span_day(e, abs, a->moon_offset, NULL) < 0
+                        : !iwd_occurs_on(e->abs, e->repeat, abs, a->moon_offset)) continue;
         if (n == cap_refs) {
             int nc = cap_refs * 2;
             EvRef *nr = (EvRef *)malloc((size_t)nc * sizeof *nr);
@@ -2346,6 +2442,7 @@ int alm_marks_on(const Almanac *a, int32_t abs, AlmMark *out, int cap)
         if (out && k < cap) {
             out[k].builtin = true; out[k].event = NULL; out[k].type = ALM_EV_AURIL;
             out[k].title = ALM_NEW_MOON_TITLE; out[k].chip = ALM_NEW_MOON_SHORT;
+            out[k].span_day = 0; out[k].span_len = 1; out[k].span_start = abs;
         }
         k++;
     }
@@ -2361,9 +2458,48 @@ int alm_marks_on(const Almanac *a, int32_t abs, AlmMark *out, int cap)
         AlmMark *mk = &out[k + i];
         mk->builtin = false; mk->event = evs[i]; mk->type = evs[i]->type;
         mk->title = evs[i]->title; mk->chip = evs[i]->title;
+        mk->span_start = abs;
+        mk->span_len = evs[i]->days > 1 ? evs[i]->days : 1;
+        mk->span_day = mk->span_len > 1 ? alm_event_span_day(evs[i], abs, a->moon_offset, &mk->span_start) : 0;
+        if (mk->span_day < 0) { mk->span_day = 0; mk->span_start = abs; }
     }
     if (evs != stack) free((void *)evs);
     return k + n;
+}
+
+/* A short date whose spaces are U+00A0, so "5 Hammer" never wraps inside itself. */
+static void sb_add_nbsp_date(SB *sb, int32_t abs)
+{
+    char d[IWD_DATE_CAP];
+    fmt_date(abs, true, d);
+    for (const char *p = d; *p; p++) {
+        if (*p == ' ') sb_adds(sb, "\xC2\xA0");
+        else { char c[2] = { *p, 0 }; sb_adds(sb, c); }
+    }
+}
+
+size_t alm_fmt_span_range(int32_t start, int days, char *buf, size_t cap)
+{
+    SB sb;
+    sb_init(&sb, buf, cap);
+    if (start < IWD_ABS_MIN) start = IWD_ABS_MIN;
+    if (start > IWD_ABS_MAX) start = IWD_ABS_MAX;
+    if (days < 1) days = 1;
+    if (days > ALM_EVENT_DAYS_MAX) days = ALM_EVENT_DAYS_MAX;
+    int64_t l = (int64_t)start + days - 1;
+    int32_t last = (int32_t)(l > IWD_ABS_MAX ? IWD_ABS_MAX : l);
+    if (last == start) { sb_add_nbsp_date(&sb, start); return sb.len; }
+    IwdDate d0 = iwd_from_abs(start), d1 = iwd_from_abs(last);
+    if (d0.festival == IWD_FEST_NONE && d1.festival == IWD_FEST_NONE &&
+        d0.year == d1.year && d0.month == d1.month) {
+        sb_addf(&sb, "%d\xE2\x80\x93", d0.day);      /* "5–9 Hammer" */
+        sb_add_nbsp_date(&sb, last);
+    } else {
+        sb_add_nbsp_date(&sb, start);
+        sb_adds(&sb, " \xE2\x80\x93 ");
+        sb_add_nbsp_date(&sb, last);
+    }
+    return sb.len;
 }
 
 size_t alm_fmt_mark_meta(const AlmMark *m, int32_t shown_abs, char *buf, size_t cap)
@@ -2381,6 +2517,23 @@ size_t alm_fmt_mark_meta(const AlmMark *m, int32_t shown_abs, char *buf, size_t 
         sb_adds(&sb, " \xC2\xB7 since ");
         sb_adds(&sb, d);
         sb_addf(&sb, " %ld", (long)iwd_from_abs(e->abs).year);
+    }
+    if (m->span_len > 1) {
+        char rg[96];
+        alm_fmt_span_range(m->span_start, m->span_len, rg, sizeof rg);
+        sb_addf(&sb, " \xC2\xB7 Day %d of %d \xC2\xB7 %s", m->span_day + 1, m->span_len, rg);
+    }
+    return sb.len;
+}
+
+size_t alm_fmt_mark_chip(const AlmMark *m, bool starts, char *buf, size_t cap)
+{
+    SB sb;
+    sb_init(&sb, buf, cap);
+    sb_adds(&sb, m->chip ? m->chip : m->title ? m->title : "");
+    if (m->span_len > 1) {
+        if (starts && m->span_day == 0) sb_addf(&sb, " \xC2\xB7 %d days", m->span_len);
+        else sb_addf(&sb, " \xC2\xB7 day %d of %d", m->span_day + 1, m->span_len);
     }
     return sb.len;
 }
@@ -2494,6 +2647,10 @@ size_t alm_fmt_cell_label(const Almanac *a, const AlmCell *c, char *buf, size_t 
                 for (int i = 0; i < n; i++) {
                     if (i) sb_adds(&sb, ", ");
                     sb_adds(&sb, evs[i]->title);
+                    if (evs[i]->days > 1) {
+                        int k = alm_event_span_day(evs[i], c->abs, a->moon_offset, NULL);
+                        if (k >= 0) sb_addf(&sb, " (day %d of %d)", k + 1, evs[i]->days);
+                    }
                 }
             }
             free((void *)evs);
@@ -2502,7 +2659,6 @@ size_t alm_fmt_cell_label(const Almanac *a, const AlmCell *c, char *buf, size_t 
     if (c->has_note) sb_part(&sb, &any, "has notes");
     if (c->is_today) sb_part(&sb, &any, "current day");
     if (c->is_start) sb_part(&sb, &any, "expedition start");
-    if (c->is_festival) sb_adds(&sb, ", festival");
     return sb.len;
 }
 
@@ -2514,9 +2670,32 @@ int alm_upcoming(const Almanac *a, AlmUpcoming out[ALM_UPCOMING_DAYS + 1])
     for (int32_t d = 0; d <= ALM_UPCOMING_DAYS; d++) {
         int64_t abs = (int64_t)base + d;
         if (!valid_abs(abs)) break;
-        int n = alm_marks_on(a, (int32_t)abs, NULL, 0);
-        if (n > 0) { out[k].abs = (int32_t)abs; out[k].rel_days = d; out[k].n_marks = n; k++; }
+        AlmUpcoming row = { (int32_t)abs, d, 0 };
+        int n = alm_upcoming_marks(a, &row, NULL, 0);
+        if (n > 0) { row.n_marks = n; out[k++] = row; }
     }
+    return k;
+}
+
+int alm_upcoming_marks(const Almanac *a, const AlmUpcoming *row, AlmMark *out, int cap)
+{
+    int total = alm_marks_on(a, row->abs, NULL, 0);
+    if (total <= 0) return 0;
+    AlmMark stack[16];
+    AlmMark *all = stack;
+    if (total > 16) {
+        all = (AlmMark *)malloc((size_t)total * sizeof *all);
+        if (!all) return 0;
+    }
+    int n = alm_marks_on(a, row->abs, all, total), k = 0;
+    if (n > total) n = total;
+    for (int i = 0; i < n; i++) {
+        /* a span is listed where it starts, or on the first row while in progress */
+        if (!all[i].builtin && all[i].span_day > 0 && row->rel_days > 0) continue;
+        if (out && k < cap) out[k] = all[i];
+        k++;
+    }
+    if (all != stack) free(all);
     return k;
 }
 

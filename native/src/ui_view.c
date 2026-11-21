@@ -38,6 +38,7 @@
  *   H_NONE      : 0   opaque cover behind the header and the toast (blocks the page below)
  *   H_UNIT_F    : 0   / H_UNIT_C : 0   temperature unit segments
  *   H_SOUND     : 0   sound toggle chip
+ *   H_INTERIOR  : 0   interior (muffled sound) chip; enabled only while the sound is on
  *   H_SETTINGS  : 0   header Settings chip
  *   H_KEYS      : 0   "?" chip in the header (keyboard shortcuts card)
  *   H_SAVE_FAIL : 0   "Not saved" header chip (Save dialog for a backup)
@@ -188,8 +189,11 @@ static int chip_h(void) { return fh(F_SMALL) + dp(6); }
 
 static int chip(int x, int y, const AlmMark *m, int maxw, bool draw)
 {
-    const WCHAR *s = wz(m->chip ? m->chip : m->title);
+    char ct[200];
+    const WCHAR *s;
     DWORD col = rgb_u(alm_ev_type_rgb(m->type));
+    alm_fmt_mark_chip(m, false, ct, sizeof ct);     /* a span: "Fair · day 2 of 5" */
+    s = wz(ct);
     int lead = m->builtin ? dp(18) : dp(11), w = lead + tw(F_SMALL, s, -1) + dp(8), h = chip_h();
     if (maxw > 0 && w > maxw) w = maxw;
     if (draw) {
@@ -1324,7 +1328,7 @@ static void header_paint(int W)
     px_fill(0, hh - 1, W, hh, C_LINE);
     hot_add(0, 0, W, hh, H_NONE, 0, false, NULL);           /* covers the page under the header */
 
-    /* tools, right to left: Settings, Sound, F/C, ? */
+    /* tools, right to left: Settings, Interior, Sound, F/C, ? */
     rx = right;
     {
         const WCHAR *s = L"Settings";
@@ -1332,18 +1336,42 @@ static void header_paint(int W)
         button(rx - w, cy0, rx, cy1, H_SETTINGS, true, s, F_BTN, L"Settings (F2)");
         rx -= w + dp(8);
     }
-    {
-        const WCHAR *s = g.sound_missing ? L"No audio" : audio_is_enabled() ? L"Sound on" : L"Sound off";
-        int w = tw(F_BTN, L"Sound off", -1) + dp(28);
+    {   /* Interior: muffles the sound as heard indoors; usable only while the sound plays */
+        const WCHAR *s = L"Interior";
+        int w = tw(F_BTN, s, -1) + dp(28);
+        bool live = !g.sound_missing && audio_is_enabled(), on = g.a.native.interior;
+        bool hot = live && is_hot(H_INTERIOR);
+        DWORD fill = hot ? mix(C_PANEL2, C_ACCENT, 34) : live ? C_PANEL2 : C_BG;
+        DWORD frame = live && on ? mix(C_FRAME, C_ACCENT, 150) : hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME;
+        px_box(rx - w, cy0, rx, cy1, fill, frame);
+        if (on) aa_circle(rx - w + dp(11), cy, dp(3), live ? C_ACCENT : C_DIM, 255);
+        else    aa_ring(rx - w + dp(11), cy, dp(3), live ? C_MUTED : C_DIM, 255, 1.0);
+        aa_flush();
+        tx(F_BTN, rx - w + dp(19), cy - fh(F_BTN) / 2, s, -1, !live ? C_DIM : on ? C_BRIGHT : C_SOFT);
+        hot_add(rx - w, cy0, rx, cy1, H_INTERIOR, 0, live,
+                live ? L"Muffle the wind, as heard indoors (I)"
+                     : L"Muffle the wind, as heard indoors (I) \x00B7 turn the sound on first");
+        rx -= w + dp(6);
+    }
+    {   /* "Sound": the dot carries on / off (as on the Interior chip) */
+        const WCHAR *s = g.sound_missing ? L"No audio" : L"Sound";
+        int w = tw(F_BTN, s, -1) + dp(28);
         bool on = !g.sound_missing && audio_is_enabled(), hot = is_hot(H_SOUND);
         DWORD fill = hot ? mix(C_PANEL2, C_ACCENT, 34) : C_PANEL2;
+        WCHAR tip[96];
+        unsigned gaps = audio_underruns();
         px_box(rx - w, cy0, rx, cy1, fill, on ? mix(C_FRAME, C_ACCENT, 150) : hot ? mix(C_FRAME, C_ACCENT, 140) : C_FRAME);
         /* level mark: a small filled dot when on, ring when off */
         if (on) aa_circle(rx - w + dp(11), cy, dp(3), C_ACCENT, 255);
         else    aa_ring(rx - w + dp(11), cy, dp(3), C_MUTED, 255, 1.0);
         aa_flush();
         tx(F_BTN, rx - w + dp(19), cy - fh(F_BTN) / 2, s, -1, g.sound_missing ? C_DIM : on ? C_BRIGHT : C_SOFT);
-        hot_add(rx - w, cy0, rx, cy1, H_SOUND, 0, true, L"Howling wind ambience (M)");
+        /* the device-queue underrun counter: tells a starved playback thread from anything else */
+        if (gaps > 0)
+            wsprintfW(tip, L"Howling wind ambience (M) \x00B7 %u playback gap%s this session", gaps, gaps == 1 ? L"" : L"s");
+        else
+            lstrcpyW(tip, L"Howling wind ambience (M)");
+        hot_add(rx - w, cy0, rx, cy1, H_SOUND, 0, true, tip);
         rx -= w + dp(8);
     }
     {
@@ -1407,16 +1435,37 @@ static void header_paint(int W)
                 pill(F_SMALL_B, cx, cy - pill_h(F_SMALL_B) / 2, wz(hr.tag), 0xFFC999, true, true);
                 cx += pill(F_SMALL_B, 0, 0, wz(hr.tag), 0, false, false) + dp(8);
             }
-            {   /* tight (narrow window, "Tomorrow" pill): keep the DC, drop the tier's name */
-                int need = 0;
-                for (i = 0; i < np; i++) need += tw(part[i].f, part[i].s, -1) + (i ? tw(F_BODY, L"  \x00B7  ", -1) : 0);
-                if (cx + need > room) wsprintfW(wtier, L"DC %d", L.cold.dc);
-            }
-            for (i = 0; i < np && cx < room; i++) {
+            {   /* fit by priority: drop the tier's name (the DC stays), then the date, then
+                 * the clock; if event, temperature and DC still do not fit, only the event
+                 * name is shortened (or left out rather than drawn as a lone ellipsis) */
                 const WCHAR *sep = L"  \x00B7  ";
-                if (i) { tx(F_BODY, cx, cy - fh(F_BODY) / 2, sep, -1, C_DIM); cx += tw(F_BODY, sep, -1); }
-                if (cx >= room) break;
-                cx += tx_ellipsis(part[i].f, cx, cy - fh(part[i].f) / 2, room - cx, part[i].s, part[i].c);
+                int sepw = tw(F_BODY, sep, -1), pw[5], k, minev = tw(F_BODY_B, L"Wh\x2026", -1);
+                bool use[5] = { true, true, true, true, true }, first = true;
+                for (;;) {
+                    int need = 0, cnt = 0;
+                    for (i = 0; i < np; i++) {
+                        pw[i] = tw(part[i].f, part[i].s, -1);
+                        if (use[i]) { need += pw[i] + (cnt ? sepw : 0); cnt++; }
+                    }
+                    if (cx + need <= room) break;
+                    if (wtier[0] != L'D' || wtier[1] != L'C') { wsprintfW(wtier, L"DC %d", L.cold.dc); continue; }
+                    if (use[0]) { use[0] = false; continue; }
+                    if (use[1]) { use[1] = false; continue; }
+                    break;
+                }
+                for (i = 0; i < np && cx < room; i++) {
+                    int avail;
+                    if (!use[i]) continue;
+                    avail = room - cx - (first ? 0 : sepw);
+                    if (i == 2) {                       /* event: leave room for temp and DC */
+                        for (k = 3; k < np; k++) if (use[k]) avail -= sepw + pw[k];
+                        if (avail < minev) continue;    /* no lone ellipsis */
+                    }
+                    if (avail <= 0) break;
+                    if (!first) { tx(F_BODY, cx, cy - fh(F_BODY) / 2, sep, -1, C_DIM); cx += sepw; }
+                    first = false;
+                    cx += tx_ellipsis(part[i].f, cx, cy - fh(part[i].f) / 2, avail, part[i].s, part[i].c);
+                }
             }
             hot_add(x - dp(4), cy0, (cx < room ? cx : room) + dp(4), cy1, H_HEAD_NOW, 0, true, L"Back to the weather (Ctrl+Home)");
             return;
@@ -1493,13 +1542,17 @@ static void toast_paint(int W, int H)
         int one = 0, th;
         th = markup(g.toast, 0, 0, iw, F_BODY, F_BODY_B, C_TEXT, C_BRIGHT, false, &one);
         if (th <= 0) return;
+        int hw = g.toast_hint[0] ? tw(F_SMALL, wz(g.toast_hint), -1) : 0;
+        if (hw > one) { one = hw < iw ? hw : iw; }
         bw = (one + dp(2) < iw ? one + dp(2) : iw) + 2 * pad;
         if (one + dp(2) < iw) th = markup(g.toast, 0, 0, one + dp(2), F_BODY, F_BODY_B, C_TEXT, C_BRIGHT, false, NULL);
-        bh = th + 2 * pad;
+        bh = th + 2 * pad + (g.toast_hint[0] ? dp(6) + fh(F_SMALL) : 0);
         x0 = (W - bw) / 2; y0 = H - dp(24) - bh;
         px_box(x0, y0, x0 + bw, y0 + bh, C_PANEL2, C_FRAME);
         px_fill(x0, y0, x0 + bw, y0 + dp(2), C_ACCENT);
         markup(g.toast, x0 + pad, y0 + pad, bw - 2 * pad, F_BODY, F_BODY_B, C_TEXT, C_BRIGHT, true, NULL);
+        if (g.toast_hint[0])
+            tx_ellipsis(F_SMALL, x0 + pad, y0 + bh - pad - fh(F_SMALL), bw - 2 * pad, wz(g.toast_hint), C_MUTED);
         hot_add(x0, y0, x0 + bw, y0 + bh, H_TOAST, 0, true, NULL);
     }
 }
@@ -1514,12 +1567,13 @@ static void keys_paint(int W, int H)
         { L"Shift+\x2190 \x2192", L"30 minutes" },
         { L"Ctrl+\x2190 \x2192", L"5 minutes" },
         { L"N", L"Advance the party to the next day" },
-        { L"Ctrl+Z", L"Step back" },
+        { L"Ctrl+Z", L"Undo the last day step or deletion" },
         { L"PgUp  PgDn", L"View the previous / next day" },
         { L"T  Esc", L"Back to today" },
         { L"E", L"New event or reminder" },
         { L"O", L"Write a note" },
         { L"M", L"Wind sound" },
+        { L"I", L"Interior: muffled, as heard indoors" },
         { L"F2", L"Settings" },
         { L"F1", L"This card" },
     };
